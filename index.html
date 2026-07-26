@@ -1,1475 +1,762 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Planner</title>
-<style>
-  :root{
-    --bg:#F2F2F7;
-    --panel:#FFFFFF;
-    --sidebar:#F9F9FB;
-    --text:#1C1C1E;
-    --sub:#8E8E93;
-    --line:#E5E5EA;
-    --accent:#FF9500;
-    --accent2:#FF7A00;
-    --red:#FF3B30;
-    --green:#34C759;
-    --blue:#007AFF;
-    --font:-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-    --ease: cubic-bezier(0.16, 1, 0.3, 1);
-  }
-  *{box-sizing:border-box;-webkit-font-smoothing:antialiased;}
-  @media (prefers-reduced-motion: no-preference){
-    .nav-item, .subject-row, .new-btn, .add-subject-btn, .row, .checkbox, .chev,
-    .cal-cell, .filter-chip, .icon-btn, .subject-edit-btn, .type-toggle button,
-    .swatch-opt, .emoji-opt, .progress-bar-fill, .card, .btn-primary, .btn-secondary, .btn-danger{
-      transition: background-color .18s var(--ease), color .18s var(--ease), border-color .18s var(--ease),
-        transform .18s var(--ease), box-shadow .18s var(--ease), opacity .18s var(--ease), width .3s var(--ease);
-    }
-  }
-  body{
-    margin:0;background:var(--bg);color:var(--text);font-family:var(--font);
-    height:100vh;overflow:hidden;
-  }
-  .app{display:grid;grid-template-columns:280px 1fr;height:100vh;}
-  @media (max-width:760px){
-    .app{grid-template-columns:1fr;}
-    .sidebar{display:none;}
-    .sidebar.open{display:flex;position:fixed;inset:0;z-index:40;width:100%;}
-  }
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const fs = require('fs');
+const { WebSocketServer } = require('ws');
+const crypto = require('crypto');
+const accounts = require('./accounts');
 
-  /* Sidebar */
-  .sidebar{
-    background:var(--sidebar);border-right:1px solid var(--line);
-    display:flex;flex-direction:column;padding:20px 14px;overflow-y:auto;
-  }
-  .brand{font-size:1.7rem;font-weight:800;letter-spacing:-0.5px;margin:6px 8px 20px;}
-  .nav-item{
-    display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:9px;
-    cursor:pointer;font-size:0.98rem;font-weight:500;color:var(--text);margin-bottom:2px;
-  }
-  .nav-item:hover{background:#ECECEE;}
-  .nav-item:active{transform:scale(0.98);}
-  .nav-item.active{background:var(--accent);color:white;box-shadow:0 2px 8px rgba(255,149,0,0.35);}
-  .nav-icon{
-    width:26px;height:26px;border-radius:6px;display:flex;align-items:center;justify-content:center;
-    font-size:0.85rem;flex-shrink:0;color:white;
-  }
-  .nav-item.active .nav-icon{background:rgba(255,255,255,0.25);}
+// token -> username, for simple session auth. Sessions are in-memory (fine
+// per the single-instance deployment note in the README); the underlying
+// account data itself lives in Postgres via accounts.js.
+const sessions = new Map();
 
-  .sidebar-section{
-    margin-top:22px;padding:0 10px;
-  }
-  .sidebar-section-head{
-    display:flex;justify-content:space-between;align-items:center;
-    font-size:0.78rem;font-weight:600;color:var(--sub);text-transform:uppercase;
-    letter-spacing:0.3px;margin-bottom:8px;cursor:pointer;
-    user-select:none;
-  }
-  .sidebar-section-head .section-chev{
-    font-size:0.7rem;color:var(--sub);transition:transform .22s var(--ease);
-    display:inline-block;
-  }
-  .sidebar-section.collapsed .section-chev{transform:rotate(-90deg);}
-  .sidebar-section-body{
-    overflow:hidden;
-    max-height:1000px;
-    transition:max-height .28s var(--ease), opacity .22s var(--ease);
-    opacity:1;
-  }
-  .sidebar-section.collapsed .sidebar-section-body{
-    max-height:0;opacity:0;
-  }
-  .subject-row{
-    display:flex;align-items:center;gap:9px;padding:7px 8px;border-radius:8px;
-    cursor:pointer;font-size:0.92rem;margin-bottom:1px;
-  }
-  .subject-row:hover{background:#ECECEE;}
-  .subject-row:active{transform:scale(0.98);}
-  .subject-row.active{background:#E4E4E8;}
-  .subject-swatch{
-    width:24px;height:24px;border-radius:6px;flex-shrink:0;display:flex;align-items:center;
-    justify-content:center;font-size:0.8rem;color:white;font-weight:600;
-  }
-  .subject-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .subject-count{font-size:0.78rem;color:var(--sub);font-variant-numeric:tabular-nums;}
-  .subject-edit-btn{
-    opacity:0;background:none;border:none;color:var(--sub);cursor:pointer;font-size:0.85rem;padding:2px 4px;
-  }
-  .subject-row:hover .subject-edit-btn{opacity:1;}
+// username -> connection state object, for players who are logged in and
+// reachable for friend requests / ranked challenges (set via the 'identify'
+// WS message). This is separate from being in a game room.
+const presenceSockets = new Map();
+// pairKey (sorted "a|b") -> { fromUsername, toUsername } pending challenge
+const pendingChallenges = new Map();
 
-  .add-subject-btn{
-    color:var(--accent);font-size:0.92rem;font-weight:500;padding:8px 8px;
-    cursor:pointer;background:none;border:none;text-align:left;width:100%;
-  }
-  .add-subject-btn:hover{text-decoration:underline;}
+function makeToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
 
-  /* Main */
-  .main{overflow-y:auto;padding:28px 36px 60px;}
-  #calendarRoot{margin-bottom:8px;}
-  @keyframes contentFadeIn{
-    from{opacity:0;transform:translateY(6px);}
-    to{opacity:1;transform:translateY(0);}
-  }
-  #mainContent > *{animation:contentFadeIn .32s var(--ease);}
-  .list, .cal-grid, .summary-strip{animation:contentFadeIn .28s var(--ease);}
-  .main-head{
-    display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:22px;
-    flex-wrap:wrap;gap:12px;
-  }
-  .main-head h1{font-size:2.1rem;font-weight:800;margin:0;letter-spacing:-0.5px;}
-  .new-btn{
-    background:var(--accent);color:white;border:none;border-radius:20px;
-    padding:10px 18px;font-size:0.92rem;font-weight:600;cursor:pointer;
-    box-shadow:0 2px 10px rgba(255,149,0,0.35);
-  }
-  .new-btn:hover{background:var(--accent2);box-shadow:0 4px 14px rgba(255,149,0,0.45);transform:translateY(-1px);}
-  .new-btn:active{transform:translateY(0) scale(0.97);box-shadow:0 1px 4px rgba(255,149,0,0.35);}
-  .new-btn:focus-visible, .icon-btn2:focus-visible, .nav-item:focus-visible{outline:2px solid var(--blue);outline-offset:2px;}
+const WIN_DIAMONDS = 2;
+const RANKED_HIDE_MS = 8000;
+const RANKED_SEEK_MS = 20000;
 
-  .group-label{
-    font-size:0.78rem;font-weight:700;color:var(--sub);text-transform:uppercase;
-    letter-spacing:0.4px;margin:22px 0 8px;
-    position:sticky;top:0;background:var(--bg);padding:6px 0 6px 2px;z-index:5;
-    display:flex;align-items:center;gap:8px;
-  }
-  .group-label .group-count{
-    font-size:0.7rem;font-weight:600;color:var(--sub);background:#E5E5EA;
-    border-radius:20px;padding:1px 7px;
-  }
-  .group-label.clickable{cursor:pointer;user-select:none;}
-  .group-label.clickable:hover{color:var(--text);}
-  .group-label .grp-chev{font-size:0.7rem;transition:transform .2s var(--ease);}
-  .group-label.collapsed-group .grp-chev{transform:rotate(-90deg);}
+const PORT = process.env.PORT || 8080;
+const MAPS_DIR = path.join(__dirname, 'public', 'maps');
+const MAP_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 
-  .search-bar{
-    display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);
-    border-radius:10px;padding:8px 12px;margin-bottom:18px;box-shadow:0 1px 3px rgba(0,0,0,0.03);
+function listMapFiles() {
+  try {
+    return fs.readdirSync(MAPS_DIR)
+      .filter(f => MAP_EXTENSIONS.has(path.extname(f).toLowerCase()))
+      .sort();
+  } catch {
+    return [];
   }
-  .search-bar input{
-    border:none;outline:none;flex:1;font-size:0.92rem;font-family:var(--font);background:transparent;color:var(--text);
-  }
-  .search-bar input::placeholder{color:var(--sub);}
-  .search-bar .search-icon{color:var(--sub);font-size:0.9rem;}
-  .search-clear{
-    background:none;border:none;color:var(--sub);cursor:pointer;font-size:0.85rem;padding:2px 4px;
-    display:none;
-  }
-  .search-bar.has-text .search-clear{display:inline-block;}
+}
 
-  .notes-preview{
-    background:var(--panel);border:1px solid var(--line);border-radius:12px;
-    padding:12px 16px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.03);
-  }
-  .notes-preview-head{
-    font-size:0.78rem;font-weight:700;color:var(--sub);text-transform:uppercase;
-    letter-spacing:0.4px;margin-bottom:8px;display:flex;align-items:center;gap:6px;
-  }
-  .notes-preview-row{
-    display:flex;gap:10px;align-items:flex-start;padding:6px 0;cursor:pointer;border-radius:8px;
-  }
-  .notes-preview-row:hover{background:#FAFAFB;}
-  .notes-preview-date{
-    font-size:0.78rem;font-weight:700;color:var(--accent);flex-shrink:0;width:64px;
-  }
-  .notes-preview-text{font-size:0.88rem;color:var(--text);overflow:hidden;text-overflow:ellipsis;
-    display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;}
-  .notes-preview-events{display:flex;gap:5px;flex-wrap:wrap;}
+const app = express();
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('/health', (req, res) => res.status(200).send('ok'));
+app.get('/api/maps', (req, res) => res.json({ maps: listMapFiles() }));
 
-  .day-events-list{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:10px;}
-  .day-event-chip{
-    display:flex;align-items:center;gap:6px;background:#FFF1DC;color:#B25E00;
-    border:1px solid #FFDDA8;border-radius:20px;padding:5px 8px 5px 12px;font-size:0.85rem;font-weight:600;
-  }
-  .day-event-chip .remove-event{
-    background:none;border:none;cursor:pointer;color:#B25E00;font-size:0.8rem;line-height:1;
-    padding:2px 4px;opacity:0.7;
-  }
-  .day-event-chip .remove-event:hover{opacity:1;}
-  .day-event-add{display:flex;gap:8px;}
-  .day-event-add input{
-    flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:8px;font-size:0.9rem;
-    font-family:var(--font);outline:none;
-  }
-  .day-event-add input:focus{border-color:var(--accent);}
-  .day-event-add button{
-    background:var(--accent);color:white;border:none;border-radius:8px;padding:0 16px;
-    font-size:0.85rem;font-weight:600;cursor:pointer;
-  }
-  .day-event-add button:hover{background:var(--accent2);}
-  .cal-event-chip{
-    font-size:0.68rem;font-weight:700;background:#FFF1DC;color:#B25E00;border-radius:5px;
-    padding:1px 5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  }
-  .file-chip{
-    display:flex;align-items:center;gap:6px;background:#E7F3F3;color:#1E6564;
-    border:1px solid #C7E6E5;border-radius:20px;padding:5px 8px 5px 12px;font-size:0.85rem;font-weight:600;
-    cursor:pointer;text-decoration:none;
-  }
-  .file-chip:hover{background:#DBEDEC;}
-  .file-chip .remove-file{
-    background:none;border:none;cursor:pointer;color:#1E6564;font-size:0.8rem;line-height:1;
-    padding:2px 4px;opacity:0.7;
-  }
-  .file-chip .remove-file:hover{opacity:1;}
-  .manual-file-row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;}
-  .manual-file-row input{
-    flex:1;min-width:140px;padding:9px 12px;border:1px solid var(--line);border-radius:8px;font-size:0.85rem;
-    font-family:var(--font);outline:none;
-  }
-  .manual-file-row input:focus{border-color:var(--accent);}
-  .manual-file-row button{
-    background:var(--accent);color:white;border:none;border-radius:8px;padding:0 16px;
-    font-size:0.85rem;font-weight:600;cursor:pointer;
-  }
-  .manual-file-row button:hover{background:var(--accent2);}
-  .list{background:var(--panel);border-radius:12px;overflow:hidden;border:1px solid var(--line);box-shadow:0 1px 3px rgba(0,0,0,0.04);}
+// ---- Accounts (username/password + diamond balance) ----
+app.get('/api/accounts-enabled', (req, res) => res.json({ enabled: accounts.isEnabled() }));
 
-  .row{
-    display:flex;align-items:center;gap:12px;padding:12px 16px;
-    border-bottom:1px solid var(--line);cursor:pointer;position:relative;
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    const account = await accounts.register(username, password);
+    const token = makeToken();
+    sessions.set(token, account.username);
+    res.json({ token, account });
+  } catch (e) {
+    res.status(400).json({ message: e.message });
   }
-  .row:last-child{border-bottom:none;}
-  .row:hover{background:#FAFAFB;}
-  .row:hover .chev{transform:translateX(2px);color:var(--sub);}
-  .row:active{background:#F2F2F4;}
-  .row.done{opacity:0.5;transition:opacity .3s var(--ease);}
-  .row.done .row-title{text-decoration:line-through;}
+});
 
-  .checkbox{
-    width:22px;height:22px;border-radius:50%;border:2px solid #C7C7CC;flex-shrink:0;
-    display:flex;align-items:center;justify-content:center;color:white;font-size:12px;
-    transform:scale(1);
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    const account = await accounts.login(username, password);
+    const token = makeToken();
+    sessions.set(token, account.username);
+    res.json({ token, account });
+  } catch (e) {
+    res.status(400).json({ message: e.message });
   }
-  .checkbox:hover{border-color:var(--green);}
-  .checkbox.checked{background:var(--green);border-color:var(--green);animation:checkPop .32s var(--ease);}
-  @keyframes checkPop{
-    0%{transform:scale(0.7);}
-    50%{transform:scale(1.15);}
-    100%{transform:scale(1);}
-  }
+});
 
-  .row-icon{
-    width:34px;height:34px;border-radius:9px;flex-shrink:0;display:flex;align-items:center;
-    justify-content:center;color:white;font-size:0.95rem;font-weight:600;
+app.get('/api/me', async (req, res) => {
+  try {
+    const token = String(req.query.token || '');
+    const username = sessions.get(token);
+    if (!username) return res.status(401).json({ message: 'Not logged in.' });
+    const account = await accounts.getAccount(username);
+    if (!account) return res.status(401).json({ message: 'Account no longer exists.' });
+    res.json({ account });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
   }
-  .row-body{flex:1;min-width:0;}
-  .row-title{font-size:0.98rem;font-weight:600;}
-  .row-sub{font-size:0.82rem;color:var(--sub);display:flex;align-items:center;gap:5px;margin-top:1px;}
-  .type-chip{
-    font-size:0.68rem;font-weight:700;text-transform:uppercase;letter-spacing:0.3px;
-    padding:1px 6px;border-radius:5px;background:#ECECEE;color:var(--sub);
-  }
-  .row-due{font-size:0.85rem;font-weight:600;text-align:right;flex-shrink:0;color:var(--sub);}
-  .row-due.soon{color:var(--red);}
-  .priority-dot{
-    display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;
-  }
-  .summary-strip{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap;}
-  .summary-card{
-    background:var(--panel);border:1px solid var(--line);border-radius:12px;
-    padding:12px 16px;min-width:110px;cursor:default;box-shadow:0 1px 3px rgba(0,0,0,0.03);
-  }
-  .summary-card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.06);}
-  .summary-card .num{font-size:1.5rem;font-weight:800;line-height:1;}
-  .summary-card .lbl{font-size:0.75rem;color:var(--sub);margin-top:3px;font-weight:600;}
-  .summary-card.overdue .num{color:var(--red);}
-  .summary-card.today .num{color:var(--accent);}
-  .chev{color:#C7C7CC;font-size:1rem;flex-shrink:0;}
+});
 
-  .empty-state{
-    text-align:center;padding:70px 20px;color:var(--sub);
-  }
-  .empty-state .big{font-size:1.3rem;font-weight:700;color:var(--text);display:block;margin-bottom:6px;}
+app.post('/api/logout', (req, res) => {
+  const { token } = req.body || {};
+  sessions.delete(token);
+  res.json({ ok: true });
+});
 
-  /* Calendar view */
-  .cal-nav-row{display:flex;align-items:center;gap:14px;margin-bottom:16px;}
-  .cal-nav-row button{
-    background:var(--panel);border:1px solid var(--line);border-radius:8px;width:32px;height:32px;
-    cursor:pointer;font-size:1rem;
-  }
-  .cal-month-title{font-size:1.2rem;font-weight:700;}
-  .cal-grid{
-    display:grid;grid-template-columns:repeat(7,1fr);gap:6px;
-  }
-  .cal-dow{text-align:center;font-size:0.75rem;color:var(--sub);font-weight:600;padding-bottom:4px;}
-  .cal-cell{
-    background:var(--panel);border:1px solid var(--line);border-radius:10px;min-height:78px;
-    padding:6px;font-size:0.8rem;cursor:pointer;
-  }
-  .cal-cell.empty{background:transparent;border:none;cursor:default;}
-  .cal-cell:not(.empty):hover{box-shadow:0 3px 10px rgba(0,0,0,0.08);transform:translateY(-2px);border-color:#D1D1D6;}
-  .cal-cell.today{border-color:var(--accent);border-width:2px;}
-  .cal-cell.has-daytype{border-top-width:4px;}
-  .dt-checkbox-row{
-    display:flex;align-items:center;gap:8px;padding:5px 0;font-size:0.88rem;
-  }
-  .dt-checkbox-row input{width:16px;height:16px;}
-  .weekday-row{
-    display:flex;align-items:center;justify-content:space-between;gap:10px;
-    padding:8px 0;border-bottom:1px solid var(--line);
-  }
-  .weekday-row:last-child{border-bottom:none;}
-  .weekday-row label{font-weight:600;font-size:0.9rem;width:90px;}
-  .weekday-row select{
-    flex:1;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
-    background:#F9F9FB;font-family:var(--font);font-size:0.88rem;
-  }
-  .chunk-row{
-    display:flex;align-items:center;gap:6px;margin-bottom:7px;
-  }
-  .chunk-row input[type="text"]{flex:2;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:#F9F9FB;font-family:var(--font);font-size:0.85rem;}
-  .chunk-row input[type="date"]{flex:1;padding:7px 6px;border:1px solid var(--line);border-radius:8px;background:#F9F9FB;font-family:var(--font);font-size:0.8rem;}
-  .chunk-row .chunk-done{width:18px;height:18px;flex-shrink:0;}
-  .chunk-row .chunk-remove{background:none;border:none;color:var(--sub);cursor:pointer;font-size:1rem;flex-shrink:0;}
-  .chunk-row .chunk-remove:hover{color:var(--red);}
-  .progress-bar{
-    height:5px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:5px;width:120px;
-  }
-  .progress-bar-fill{height:100%;background:var(--green);}
-  .cal-daynum{font-weight:600;margin-bottom:3px;}
-  .cal-item-dot{
-    font-size:0.68rem;color:white;border-radius:4px;padding:1px 4px;margin-bottom:2px;
-    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  }
+// Spend diamonds on a cosmetic/palette/power-up unlock. `key` identifies the
+// item (e.g. "brush:spray", "cosmetic:tophat", "power:no_slowdown"); `cost`
+// is trusted from a fixed price table on the server (not the client) — see
+// SHOP_PRICES below.
+const SHOP_PRICES = {
+  'power:camo_helper': 8,
+  'power:no_slowdown': 2,
+  'power:direction_ping': 2,
+  'power:footprint_trail': 8,
+  'brush:spray': 15,
+  'brush:sponge': 15,
+  'palette:neon': 10,
+  'palette:pastel': 10,
+  'cosmetic:tophat': 6,
+  'cosmetic:partyhat': 6,
+  'cosmetic:sparkletrail': 10,
+  'cosmetic:confettitrail': 10,
+};
 
-  /* Modal */
-  .overlay{
-    position:fixed;inset:0;background:rgba(0,0,0,0.35);display:flex;
-    align-items:center;justify-content:center;z-index:50;padding:16px;
-    backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
-    opacity:0;visibility:hidden;pointer-events:none;
-    transition:opacity .22s var(--ease), visibility 0s linear .22s;
+// ---- Friends ----
+function usernameFor(token) {
+  return sessions.get(String(token || ''));
+}
+
+app.get('/api/friends', async (req, res) => {
+  try {
+    const username = usernameFor(req.query.token);
+    if (!username) return res.status(401).json({ message: 'Not logged in.' });
+    const data = await accounts.listFriends(username);
+    const friends = data.friends.map(name => ({ username: name, online: presenceSockets.has(name) }));
+    res.json({ friends, incoming: data.incoming, outgoing: data.outgoing });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
   }
-  .overlay.open{opacity:1;visibility:visible;pointer-events:auto;transition:opacity .22s var(--ease);}
-  .modal{
-    background:var(--panel);border-radius:16px;width:100%;max-width:420px;
-    padding:24px;max-height:88vh;overflow-y:auto;
-    box-shadow:0 20px 60px rgba(0,0,0,0.25), 0 2px 8px rgba(0,0,0,0.08);
-    transform:scale(0.92) translateY(12px);opacity:0;
-    transition:transform .28s var(--ease), opacity .22s var(--ease);
+});
+
+app.post('/api/friends/request', async (req, res) => {
+  try {
+    const username = usernameFor((req.body || {}).token);
+    if (!username) return res.status(401).json({ message: 'Not logged in.' });
+    const target = String((req.body || {}).username || '').trim();
+    const result = await accounts.sendFriendRequest(username, target);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ message: e.message });
   }
-  .overlay.open .modal{transform:scale(1) translateY(0);opacity:1;}
-  .modal h3{font-size:1.25rem;font-weight:700;margin:0 0 18px;}
-  .field{margin-bottom:14px;}
-  .field label{
-    display:block;font-size:0.78rem;font-weight:600;color:var(--sub);margin-bottom:5px;
+});
+
+app.post('/api/friends/accept', async (req, res) => {
+  try {
+    const username = usernameFor((req.body || {}).token);
+    if (!username) return res.status(401).json({ message: 'Not logged in.' });
+    const from = String((req.body || {}).username || '').trim();
+    const result = await accounts.acceptFriendRequest(username, from);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ message: e.message });
   }
-  .field input, .field select, .field textarea{
-    width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;
-    background:#F9F9FB;font-family:var(--font);font-size:0.94rem;color:var(--text);
+});
+
+app.post('/api/friends/decline', async (req, res) => {
+  try {
+    const username = usernameFor((req.body || {}).token);
+    if (!username) return res.status(401).json({ message: 'Not logged in.' });
+    const from = String((req.body || {}).username || '').trim();
+    const result = await accounts.declineFriendRequest(username, from);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ message: e.message });
   }
-  .field input:focus, .field select:focus, .field textarea:focus{
-    outline:2px solid var(--blue);border-color:transparent;
+});
+
+app.post('/api/friends/remove', async (req, res) => {
+  try {
+    const username = usernameFor((req.body || {}).token);
+    if (!username) return res.status(401).json({ message: 'Not logged in.' });
+    const other = String((req.body || {}).username || '').trim();
+    const result = await accounts.removeFriend(username, other);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ message: e.message });
   }
-  .field textarea{resize:vertical;min-height:56px;}
-  .field-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
-  .type-toggle{display:flex;gap:6px;}
-  .type-toggle button{
-    flex:1;padding:9px 4px;border:1px solid var(--line);background:#F9F9FB;border-radius:9px;
-    font-size:0.82rem;font-weight:600;cursor:pointer;color:var(--sub);
+});
+app.post('/api/purchase', async (req, res) => {
+  try {
+    const token = String((req.body || {}).token || '');
+    const key = String((req.body || {}).key || '');
+    const username = sessions.get(token);
+    if (!username) return res.status(401).json({ message: 'Not logged in.' });
+    const cost = SHOP_PRICES[key];
+    if (cost == null) return res.status(400).json({ message: 'Unknown item.' });
+    const account = await accounts.purchaseUnlock(username, key, cost);
+    res.json({ account });
+  } catch (e) {
+    res.status(400).json({ message: e.message });
   }
-  .type-toggle button:hover{border-color:#C7C7CC;}
-  .type-toggle button:active{transform:scale(0.96);}
-  .type-toggle button.active{background:var(--accent);border-color:var(--accent);color:white;box-shadow:0 2px 6px rgba(255,149,0,0.3);}
+});
 
-  .swatch-picker{display:flex;flex-wrap:wrap;gap:8px;}
-  .swatch-opt{
-    width:30px;height:30px;border-radius:8px;cursor:pointer;border:2px solid transparent;
-  }
-  .swatch-opt:hover{transform:scale(1.12);}
-  .swatch-opt.selected{border-color:var(--text);transform:scale(1.08);}
-  .emoji-picker{display:flex;flex-wrap:wrap;gap:6px;}
-  .emoji-opt{
-    width:34px;height:34px;border-radius:8px;background:#F0F0F2;border:2px solid transparent;
-    cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center;
-  }
-  .emoji-opt:hover{background:#E4E4E8;transform:scale(1.08);}
-  .emoji-opt.selected{border-color:var(--text);}
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
 
-  .modal-actions{display:flex;justify-content:space-between;gap:8px;margin-top:20px;}
-  .modal-actions-right{display:flex;gap:8px;}
-  .btn-secondary{
-    font-size:0.9rem;background:none;border:none;padding:10px 14px;cursor:pointer;color:var(--sub);font-weight:500;border-radius:8px;
-  }
-  .btn-secondary:hover{background:#ECECEE;color:var(--text);}
-  .btn-danger{
-    font-size:0.9rem;background:none;border:none;padding:10px 14px;cursor:pointer;color:var(--red);font-weight:500;border-radius:8px;
-  }
-  .btn-danger:hover{background:rgba(255,59,48,0.1);}
-  .btn-primary{
-    font-size:0.9rem;background:var(--accent);color:white;border:none;border-radius:9px;
-    padding:10px 18px;cursor:pointer;font-weight:600;box-shadow:0 2px 8px rgba(255,149,0,0.3);
-  }
-  .btn-primary:hover{background:var(--accent2);transform:translateY(-1px);box-shadow:0 4px 12px rgba(255,149,0,0.4);}
-  .btn-primary:active{transform:translateY(0) scale(0.97);}
-  .btn-secondary:active, .btn-danger:active{transform:scale(0.96);}
-
-  .mobile-menu-btn{display:none;}
-  @media (max-width:760px){
-    .mobile-menu-btn{display:inline-flex;background:var(--panel);border:1px solid var(--line);
-      border-radius:8px;width:34px;height:34px;align-items:center;justify-content:center;cursor:pointer;margin-right:8px;}
-  }
-  @media (prefers-reduced-motion: reduce){ *{transition:none !important;} }
-</style>
-</head>
-<body>
-<div class="app">
-  <aside class="sidebar" id="sidebar">
-    <div class="brand">Planner</div>
-    <div class="nav-item active" data-view="home" tabindex="0">
-      <span class="nav-icon" style="background:var(--accent)">🏠</span> Home
-    </div>
-
-    <div class="sidebar-section" id="subjectsSection">
-      <div class="sidebar-section-head" data-toggle-section="subjectsSection"><span>Subjects</span><span class="section-chev">▾</span></div>
-      <div class="sidebar-section-body">
-        <div id="subjectList"></div>
-        <button class="add-subject-btn" id="addSubjectBtn">+ Add Subject</button>
-      </div>
-    </div>
-
-    <div class="sidebar-section" id="dayTypesSection">
-      <div class="sidebar-section-head" data-toggle-section="dayTypesSection"><span>Day Types</span><span class="section-chev">▾</span></div>
-      <div class="sidebar-section-body">
-        <div id="dayTypeList"></div>
-        <button class="add-subject-btn" id="addDayTypeBtn">+ Add Day Type</button>
-        <button class="add-subject-btn" id="weeklyScheduleBtn">🗓 Weekly Schedule</button>
-      </div>
-    </div>
-  </aside>
-
-  <main class="main">
-    <div class="main-head">
-      <h1 id="mainTitle"><span class="mobile-menu-btn" id="menuBtn">☰</span>Assignments</h1>
-      <button class="new-btn" id="newItemBtn">+ New</button>
-    </div>
-    <div class="search-bar" id="searchBar">
-      <span class="search-icon">🔍</span>
-      <input type="text" id="searchInput" placeholder="Search assignments...">
-      <button class="search-clear" id="searchClearBtn">✕</button>
-    </div>
-    <div id="mainContent"></div>
-  </main>
-</div>
-
-<!-- Item modal -->
-<div class="overlay" id="itemOverlay">
-  <div class="modal">
-    <h3 id="itemModalTitle">New item</h3>
-    <div class="field">
-      <label>Type</label>
-      <div class="type-toggle" id="typeToggle">
-        <button data-type="homework" class="active">Assignment</button>
-        <button data-type="project">Project</button>
-        <button data-type="exam">Exam / Quiz</button>
-      </div>
-    </div>
-    <div class="field">
-      <label for="iTitle">Title</label>
-      <input type="text" id="iTitle" placeholder="Chapter 4 problem set">
-    </div>
-    <div class="field-row">
-      <div class="field">
-        <label for="iSubject">Subject</label>
-        <select id="iSubject"></select>
-      </div>
-      <div class="field">
-        <label for="iDue" id="iDueLabel">Due date</label>
-        <input type="date" id="iDue">
-      </div>
-    </div>
-    <div class="field">
-      <label for="iNotes">Notes (optional)</label>
-      <textarea id="iNotes" placeholder="Details, chapters, links..."></textarea>
-    </div>
-    <div class="field">
-      <label>Priority</label>
-      <div class="type-toggle" id="priorityToggle">
-        <button data-p="low">Low</button>
-        <button data-p="medium" class="active">Medium</button>
-        <button data-p="high">High</button>
-      </div>
-    </div>
-    <div class="field" id="chunksField" style="display:none;">
-      <label>Chunks (break the project into smaller due dates)</label>
-      <div id="chunksList"></div>
-      <button class="add-subject-btn" id="addChunkBtn" style="padding-left:0;">+ Add chunk</button>
-    </div>
-    <div class="field">
-      <label>Files</label>
-      <div class="day-events-list" id="itemFilesList"></div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button class="add-subject-btn" id="itemAddFileBtn" style="padding-left:0;width:auto;">+ Add File</button>
-        <button class="add-subject-btn" id="itemManualFileBtn" style="padding-left:0;width:auto;">Paste ID instead</button>
-      </div>
-      <div class="manual-file-row" id="itemManualFileRow" style="display:none;">
-        <input type="text" id="itemManualFileId" placeholder="username/a1b2c3d4e5">
-        <input type="text" id="itemManualFileLabel" placeholder="Label (optional)">
-        <button id="itemManualFileAddBtn">Attach</button>
-      </div>
-    </div>
-    <div class="modal-actions">
-      <button class="btn-danger" id="itemDeleteBtn" style="visibility:hidden">Delete</button>
-      <div class="modal-actions-right">
-        <button class="btn-secondary" id="itemCancelBtn">Cancel</button>
-        <button class="btn-primary" id="itemSaveBtn">Save</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Subject modal -->
-<div class="overlay" id="subjectOverlay">
-  <div class="modal">
-    <h3 id="subjectModalTitle">Add subject</h3>
-    <div class="field">
-      <label for="sName">Name</label>
-      <input type="text" id="sName" placeholder="Biology 1">
-    </div>
-    <div class="field">
-      <label>Color</label>
-      <div class="swatch-picker" id="swatchPicker"></div>
-    </div>
-    <div class="field">
-      <label>Icon</label>
-      <div class="emoji-picker" id="emojiPicker"></div>
-    </div>
-    <div class="modal-actions">
-      <button class="btn-danger" id="subjectDeleteBtn" style="visibility:hidden">Delete</button>
-      <div class="modal-actions-right">
-        <button class="btn-secondary" id="subjectCancelBtn">Cancel</button>
-        <button class="btn-primary" id="subjectSaveBtn">Save</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="overlay" id="dayOverlay">
-  <div class="modal">
-    <h3 id="dayModalTitle">Day</h3>
-    <div id="dayTypeInfo" style="margin-bottom:10px;"></div>
-    <div id="dayModalList"></div>
-    <div class="field" style="margin-top:16px;">
-      <label>Events for this day</label>
-      <div class="day-events-list" id="dayEventsList"></div>
-      <div class="day-event-add">
-        <input type="text" id="dayEventInput" placeholder="e.g. No School, Memorial Day">
-        <button id="dayEventAddBtn">Add</button>
-      </div>
-    </div>
-    <div class="field">
-      <label>Files</label>
-      <div class="day-events-list" id="dayFilesList"></div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button class="add-subject-btn" id="dayAddFileBtn" style="padding-left:0;width:auto;">+ Add File</button>
-        <button class="add-subject-btn" id="dayManualFileBtn" style="padding-left:0;width:auto;">Paste ID instead</button>
-      </div>
-      <div class="manual-file-row" id="dayManualFileRow" style="display:none;">
-        <input type="text" id="dayManualFileId" placeholder="username/a1b2c3d4e5">
-        <input type="text" id="dayManualFileLabel" placeholder="Label (optional)">
-        <button id="dayManualFileAddBtn">Attach</button>
-      </div>
-    </div>
-    <div class="modal-actions">
-      <div></div>
-      <div class="modal-actions-right">
-        <button class="btn-secondary" id="dayModalCloseBtn">Close</button>
-        <button class="btn-primary" id="dayModalAddBtn">+ Add for this day</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Day type modal -->
-<div class="overlay" id="dayTypeOverlay">
-  <div class="modal">
-    <h3 id="dayTypeModalTitle">Add day type</h3>
-    <div class="field">
-      <label for="dtName">Name</label>
-      <input type="text" id="dtName" placeholder="Red Day">
-    </div>
-    <div class="field">
-      <label>Color</label>
-      <div class="swatch-picker" id="dtSwatchPicker"></div>
-    </div>
-    <div class="field">
-      <label>Classes on this day</label>
-      <div id="dtSubjectChecks"></div>
-    </div>
-    <div class="modal-actions">
-      <button class="btn-danger" id="dayTypeDeleteBtn" style="visibility:hidden">Delete</button>
-      <div class="modal-actions-right">
-        <button class="btn-secondary" id="dayTypeCancelBtn">Cancel</button>
-        <button class="btn-primary" id="dayTypeSaveBtn">Save</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Weekly schedule modal -->
-<div class="overlay" id="weeklyOverlay">
-  <div class="modal">
-    <h3>Weekly schedule</h3>
-    <div id="weeklyRows"></div>
-    <div class="modal-actions">
-      <div></div>
-      <div class="modal-actions-right">
-        <button class="btn-secondary" id="weeklyCloseBtn">Done</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<script>
-const COLORS = ['#FF9500','#FF3B30','#AF52DE','#007AFF','#34C759','#5AC8FA','#FF2D55','#8E8E93','#A2845E','#30B0C7'];
-const EMOJIS = ['📘','🧪','✏️','🏛️','🔬','🎨','🎵','💻','🧮','🌍','⚽','🗣️','📐','🧬','⚗️'];
-
-const ITEMS_KEY = 'planner-items-v2';
-const SUBJECTS_KEY = 'planner-subjects-v2';
-const DAYTYPES_KEY = 'planner-daytypes-v1';
-const WEEKDAY_KEY = 'planner-weekday-v1';
-const DAYNOTES_KEY = 'planner-daynotes-v1';
-const DAYFILES_KEY = 'planner-dayfiles-v1';
-
-/* =========================================================================
-   wnbase Files integration
-   - FILES_ORIGIN is the origin of the separate files app (files.wnbase.com).
-   - ALLOWED_FILES_ORIGINS is checked against incoming postMessage events so
-     only that app (or local test origins) can attach files. Update these
-     before deploying for real.
-   ========================================================================= */
-const FILES_ORIGIN = 'https://files.wnbase.com';
-const ALLOWED_FILES_ORIGINS = [FILES_ORIGIN, 'null', window.location.origin];
-
-let subjects = JSON.parse(localStorage.getItem(SUBJECTS_KEY) || 'null') || [
-  {id:'s1', name:'Math', color:'#FF3B30', icon:'🧮'},
-  {id:'s2', name:'Science', color:'#007AFF', icon:'🔬'},
-  {id:'s3', name:'English', color:'#FF9500', icon:'📘'},
-  {id:'s4', name:'History', color:'#34C759', icon:'🏛️'},
+// ---- Constants shared with client (kept in sync manually with public/game.js) ----
+const PALETTE = [
+  '#F2ECD9', '#D8CBA8', '#8B5E3C', '#4A2E20',
+  '#5C7A4A', '#7FA05C', '#2F6E68', '#4E9E96',
+  '#6B3F69', '#9B7BA8', '#E3A93B', '#F0D27A',
+  '#C1554D', '#E08F86', '#232946', '#5B6478'
 ];
-let items = JSON.parse(localStorage.getItem(ITEMS_KEY) || '[]');
-let dayTypes = JSON.parse(localStorage.getItem(DAYTYPES_KEY) || 'null') || [];
-let weekdaySchedule = JSON.parse(localStorage.getItem(WEEKDAY_KEY) || 'null') || {};
-let dayNotes = JSON.parse(localStorage.getItem(DAYNOTES_KEY) || 'null') || {};
-Object.keys(dayNotes).forEach(k=>{
-  if(typeof dayNotes[k] === 'string') dayNotes[k] = dayNotes[k].trim() ? [dayNotes[k].trim()] : [];
-  if(!Array.isArray(dayNotes[k])) delete dayNotes[k];
-  if(Array.isArray(dayNotes[k]) && dayNotes[k].length===0) delete dayNotes[k];
-});
-let dayFiles = JSON.parse(localStorage.getItem(DAYFILES_KEY) || 'null') || {};
+const TEAM_COLORS = ['#6B3F69', '#5C7A4A', '#E3A93B', '#2F6E68'];
+const COLS = 22, ROWS = 22; // bigger than a player's viewport
+const HIDE_MS = 60000;
+const SEEK_MS = 120000;
+const MAX_PLAYERS = 4;
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+const TAG_RADIUS = 2; // in cell units — generous, since client/server positions can drift slightly between move updates
+const HITS_TO_CATCH = 2; // a seeker has to tag a hider this many times to catch them
+const TAG_COOLDOWN_MS = 2000; // minimum time between hits landing on the same hider
+const HIDER_SEEK_SPEED_MULT = 0.25; // hiders move at this fraction of normal speed once seeking starts
+const SKIN_SIZE = 32; // 32x32 paintable pixels per character
 
-let currentView = 'home'; // home (calendar+list combined) | all (subject filter, list only)
-let activeSubjectFilter = null;
-let searchQuery = '';
-let completedCollapsed = JSON.parse(localStorage.getItem('plannerCompletedCollapsed') || 'true');
-let editingItemId = null;
-let editingSubjectId = null;
-let editingDayTypeId = null;
-let selectedDtColor = '#FF9500';
-let selectedType = 'homework';
-let selectedPriority = 'medium';
-let selectedColor = COLORS[0];
-let selectedEmoji = EMOJIS[0];
-let calViewDate = new Date(); calViewDate.setDate(1);
+const rooms = new Map(); // code -> room
 
-function saveItems(){ localStorage.setItem(ITEMS_KEY, JSON.stringify(items)); renderAll(); }
-function saveSubjects(){ localStorage.setItem(SUBJECTS_KEY, JSON.stringify(subjects)); renderAll(); }
-function saveDayTypes(){ localStorage.setItem(DAYTYPES_KEY, JSON.stringify(dayTypes)); renderAll(); }
-function saveWeekday(){ localStorage.setItem(WEEKDAY_KEY, JSON.stringify(weekdaySchedule)); renderAll(); }
-function saveDayNotes(){ localStorage.setItem(DAYNOTES_KEY, JSON.stringify(dayNotes)); }
-function saveDayFiles(){ localStorage.setItem(DAYFILES_KEY, JSON.stringify(dayFiles)); }
-function dayTypeById(id){ return dayTypes.find(d=>d.id===id); }
-function dayTypeForDate(dateStr){
-  const d = new Date(dateStr+'T00:00:00');
-  const dtId = weekdaySchedule[d.getDay()];
-  return dtId ? dayTypeById(dtId) : null;
-}
-function uid(){ return 'x'+Date.now()+Math.random().toString(36).slice(2,7); }
-function todayStr(){ return new Date().toISOString().slice(0,10); }
-function subjectById(id){ return subjects.find(s=>s.id===id); }
-function daysUntil(dateStr){
-  const today = new Date(todayStr()+'T00:00:00');
-  const due = new Date(dateStr+'T00:00:00');
-  return Math.round((due-today)/86400000);
-}
-function fmtDue(dateStr){
-  const n = daysUntil(dateStr);
-  if(n===0) return 'Today';
-  if(n===1) return 'Tomorrow';
-  if(n===-1) return 'Yesterday';
-  if(n<0) return `${Math.abs(n)}d overdue`;
-  if(n<=6) return `In ${n}d`;
-  const d = new Date(dateStr+'T00:00:00');
-  return d.toLocaleDateString('en-US',{month:'short',day:'numeric'});
-}
-function escapeHtml(s){ const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
-function isExamType(t){ return t==='quiz' || t==='exam'; }
-
-/* migrate legacy quiz-typed items to exam */
-items.forEach(i=>{ if(i.type==='quiz') i.type='exam'; });
-
-/* Nav */
-const SECTION_COLLAPSE_KEY='plannerSectionCollapse';
-let sectionCollapse = JSON.parse(localStorage.getItem(SECTION_COLLAPSE_KEY) || '{"dayTypesSection":true}');
-document.querySelectorAll('[data-toggle-section]').forEach(head=>{
-  const id = head.getAttribute('data-toggle-section');
-  const section = document.getElementById(id);
-  if(sectionCollapse[id]) section.classList.add('collapsed');
-  head.addEventListener('click', ()=>{
-    section.classList.toggle('collapsed');
-    sectionCollapse[id] = section.classList.contains('collapsed');
-    localStorage.setItem(SECTION_COLLAPSE_KEY, JSON.stringify(sectionCollapse));
-  });
-});
-
-/* Search */
-const searchInput = document.getElementById('searchInput');
-const searchBar = document.getElementById('searchBar');
-searchInput.addEventListener('input', ()=>{
-  searchQuery = searchInput.value.trim().toLowerCase();
-  searchBar.classList.toggle('has-text', searchQuery.length>0);
-  renderListView();
-});
-document.getElementById('searchClearBtn').addEventListener('click', ()=>{
-  searchInput.value = '';
-  searchQuery = '';
-  searchBar.classList.remove('has-text');
-  renderListView();
-  searchInput.focus();
-});
-
-document.querySelectorAll('.nav-item[data-view]').forEach(el=>{
-  el.addEventListener('click', ()=>{
-    currentView = el.dataset.view;
-    activeSubjectFilter = null;
-    document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
-    el.classList.add('active');
-    document.getElementById('sidebar').classList.remove('open');
-    renderAll();
-  });
-  el.addEventListener('keydown', e=>{ if(e.key==='Enter') el.click(); });
-});
-document.getElementById('menuBtn').addEventListener('click', e=>{
-  e.stopPropagation();
-  document.getElementById('sidebar').classList.toggle('open');
-});
-
-function renderDayTypeList(){
-  const root = document.getElementById('dayTypeList');
-  if(dayTypes.length===0){ root.innerHTML = `<div style="font-size:0.82rem;color:var(--sub);padding:4px 8px;">No day types yet</div>`; return; }
-  root.innerHTML = dayTypes.map(dt=>{
-    const classNames = (dt.subjectIds||[]).map(sid=>subjectById(sid)?.name).filter(Boolean).join(', ') || 'No classes assigned';
-    return `
-    <div class="subject-row" data-dtid="${dt.id}">
-      <span class="subject-swatch" style="background:${dt.color}">●</span>
-      <span class="subject-name" title="${escapeHtml(classNames)}">${escapeHtml(dt.name)}</span>
-      <button class="subject-edit-btn" data-edit-dtid="${dt.id}" title="Edit">✎</button>
-    </div>`;
-  }).join('');
-  root.querySelectorAll('[data-edit-dtid]').forEach(btn=>{
-    btn.addEventListener('click', e=>{ e.stopPropagation(); openDayTypeModal(dayTypeById(btn.dataset.editDtid)); });
-  });
+function makeCode() {
+  let code;
+  do {
+    code = Array.from({ length: 4 }, () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]).join('');
+  } while (rooms.has(code));
+  return code;
 }
 
-/* Day type modal */
-function openDayTypeModal(dt){
-  editingDayTypeId = dt ? dt.id : null;
-  document.getElementById('dayTypeModalTitle').textContent = dt ? 'Edit day type' : 'Add day type';
-  document.getElementById('dtName').value = dt ? dt.name : '';
-  selectedDtColor = dt ? dt.color : COLORS[Math.floor(Math.random()*COLORS.length)];
-  document.getElementById('dtSwatchPicker').innerHTML = COLORS.map(c=>
-    `<div class="swatch-opt ${c===selectedDtColor?'selected':''}" style="background:${c}" data-color="${c}"></div>`
-  ).join('');
-  document.querySelectorAll('#dtSwatchPicker .swatch-opt').forEach(el=>el.onclick=()=>{
-    selectedDtColor = el.dataset.color;
-    document.querySelectorAll('#dtSwatchPicker .swatch-opt').forEach(o=>o.classList.remove('selected'));
-    el.classList.add('selected');
-  });
-  const checkedIds = dt ? (dt.subjectIds||[]) : [];
-  document.getElementById('dtSubjectChecks').innerHTML = subjects.length===0
-    ? `<div style="font-size:0.82rem;color:var(--sub);">Add a subject first.</div>`
-    : subjects.map(s=>`
-      <label class="dt-checkbox-row">
-        <input type="checkbox" value="${s.id}" ${checkedIds.includes(s.id)?'checked':''}>
-        <span class="subject-swatch" style="background:${s.color};width:20px;height:20px;font-size:0.7rem;">${s.icon}</span>
-        ${escapeHtml(s.name)}
-      </label>`).join('');
-  document.getElementById('dayTypeDeleteBtn').style.visibility = dt ? 'visible' : 'hidden';
-  document.getElementById('dayTypeOverlay').classList.add('open');
-  document.getElementById('dtName').focus();
-}
-document.getElementById('addDayTypeBtn').onclick = ()=>openDayTypeModal(null);
-document.getElementById('dayTypeCancelBtn').onclick = ()=>document.getElementById('dayTypeOverlay').classList.remove('open');
-document.getElementById('dayTypeOverlay').addEventListener('click', e=>{ if(e.target.id==='dayTypeOverlay') e.currentTarget.classList.remove('open'); });
-document.getElementById('dayTypeSaveBtn').onclick = ()=>{
-  const name = document.getElementById('dtName').value.trim();
-  if(!name){ alert('Please enter a day type name.'); return; }
-  const subjectIds = Array.from(document.querySelectorAll('#dtSubjectChecks input:checked')).map(el=>el.value);
-  if(editingDayTypeId){
-    const dt = dayTypeById(editingDayTypeId);
-    dt.name = name; dt.color = selectedDtColor; dt.subjectIds = subjectIds;
-  } else {
-    dayTypes.push({id:uid(), name, color:selectedDtColor, subjectIds});
-  }
-  document.getElementById('dayTypeOverlay').classList.remove('open');
-  saveDayTypes();
-};
-document.getElementById('dayTypeDeleteBtn').onclick = ()=>{
-  if(!editingDayTypeId) return;
-  if(!confirm('Delete this day type? Any weekdays assigned to it will be cleared.')) return;
-  dayTypes = dayTypes.filter(d=>d.id!==editingDayTypeId);
-  Object.keys(weekdaySchedule).forEach(k=>{ if(weekdaySchedule[k]===editingDayTypeId) delete weekdaySchedule[k]; });
-  document.getElementById('dayTypeOverlay').classList.remove('open');
-  saveDayTypes();
-  saveWeekday();
-};
-
-/* Weekly schedule modal */
-const WEEKDAY_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-document.getElementById('weeklyScheduleBtn').onclick = ()=>{
-  const root = document.getElementById('weeklyRows');
-  if(dayTypes.length===0){
-    root.innerHTML = `<div style="font-size:0.85rem;color:var(--sub);padding:8px 0;">Add a day type first, then assign it to weekdays here.</div>`;
-  } else {
-    root.innerHTML = WEEKDAY_NAMES.map((name, idx)=>`
-      <div class="weekday-row">
-        <label>${name}</label>
-        <select data-weekday="${idx}">
-          <option value="">— None —</option>
-          ${dayTypes.map(dt=>`<option value="${dt.id}" ${weekdaySchedule[idx]===dt.id?'selected':''}>${escapeHtml(dt.name)}</option>`).join('')}
-        </select>
-      </div>`).join('');
-    root.querySelectorAll('select[data-weekday]').forEach(sel=>{
-      sel.addEventListener('change', ()=>{
-        const wd = sel.dataset.weekday;
-        if(sel.value) weekdaySchedule[wd] = sel.value; else delete weekdaySchedule[wd];
-        saveWeekday();
-      });
-    });
-  }
-  document.getElementById('weeklyOverlay').classList.add('open');
-};
-document.getElementById('weeklyCloseBtn').onclick = ()=>document.getElementById('weeklyOverlay').classList.remove('open');
-document.getElementById('weeklyOverlay').addEventListener('click', e=>{ if(e.target.id==='weeklyOverlay') e.currentTarget.classList.remove('open'); });
-
-/* Subject list render */
-function renderSubjectList(){
-  const root = document.getElementById('subjectList');
-  root.innerHTML = subjects.map(s=>{
-    const count = items.filter(i=>i.subjectId===s.id && !i.done).length;
-    const active = activeSubjectFilter===s.id ? 'active':'';
-    return `
-    <div class="subject-row ${active}" data-sid="${s.id}">
-      <span class="subject-swatch" style="background:${s.color}">${s.icon}</span>
-      <span class="subject-name">${escapeHtml(s.name)}</span>
-      <span class="subject-count">${count||''}</span>
-      <button class="subject-edit-btn" data-edit-sid="${s.id}" title="Edit">✎</button>
-    </div>`;
-  }).join('');
-
-  root.querySelectorAll('.subject-row').forEach(row=>{
-    row.addEventListener('click', e=>{
-      if(e.target.closest('.subject-edit-btn')) return;
-      const sid = row.dataset.sid;
-      activeSubjectFilter = activeSubjectFilter===sid ? null : sid;
-      currentView = 'all';
-      document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
-      document.getElementById('sidebar').classList.remove('open');
-      renderAll();
-    });
-  });
-  root.querySelectorAll('.subject-edit-btn').forEach(btn=>{
-    btn.addEventListener('click', e=>{
-      e.stopPropagation();
-      openSubjectModal(subjectById(btn.dataset.editSid));
-    });
-  });
+function makeSkin(hex) {
+  return new Array(SKIN_SIZE * SKIN_SIZE).fill(hex);
 }
 
-/* Subject modal */
-function buildPickers(){
-  document.getElementById('swatchPicker').innerHTML = COLORS.map(c=>
-    `<div class="swatch-opt ${c===selectedColor?'selected':''}" style="background:${c}" data-color="${c}"></div>`
-  ).join('');
-  document.getElementById('emojiPicker').innerHTML = EMOJIS.map(e=>
-    `<div class="emoji-opt ${e===selectedEmoji?'selected':''}" data-emoji="${e}">${e}</div>`
-  ).join('');
-  document.querySelectorAll('.swatch-opt').forEach(el=>el.onclick=()=>{selectedColor=el.dataset.color;buildPickers();});
-  document.querySelectorAll('.emoji-opt').forEach(el=>el.onclick=()=>{selectedEmoji=el.dataset.emoji;buildPickers();});
-}
-function openSubjectModal(subject){
-  editingSubjectId = subject ? subject.id : null;
-  document.getElementById('subjectModalTitle').textContent = subject ? 'Edit subject' : 'Add subject';
-  document.getElementById('sName').value = subject ? subject.name : '';
-  selectedColor = subject ? subject.color : COLORS[Math.floor(Math.random()*COLORS.length)];
-  selectedEmoji = subject ? subject.icon : EMOJIS[Math.floor(Math.random()*EMOJIS.length)];
-  document.getElementById('subjectDeleteBtn').style.visibility = subject ? 'visible' : 'hidden';
-  buildPickers();
-  document.getElementById('subjectOverlay').classList.add('open');
-  document.getElementById('sName').focus();
-}
-document.getElementById('addSubjectBtn').onclick = ()=>openSubjectModal(null);
-document.getElementById('subjectCancelBtn').onclick = ()=>document.getElementById('subjectOverlay').classList.remove('open');
-document.getElementById('subjectOverlay').addEventListener('click', e=>{ if(e.target.id==='subjectOverlay') e.currentTarget.classList.remove('open'); });
-document.getElementById('subjectSaveBtn').onclick = ()=>{
-  const name = document.getElementById('sName').value.trim();
-  if(!name){ alert('Please enter a subject name.'); return; }
-  if(editingSubjectId){
-    const s = subjectById(editingSubjectId);
-    s.name = name; s.color = selectedColor; s.icon = selectedEmoji;
-  } else {
-    subjects.push({id:uid(), name, color:selectedColor, icon:selectedEmoji});
-  }
-  document.getElementById('subjectOverlay').classList.remove('open');
-  saveSubjects();
-};
-document.getElementById('subjectDeleteBtn').onclick = ()=>{
-  if(!editingSubjectId) return;
-  const s = subjectById(editingSubjectId);
-  const inUse = items.some(i=>i.subjectId===editingSubjectId);
-  const msg = inUse ? `Delete "${s.name}"? Items using it will keep their name as text but lose color coding.` : `Delete "${s.name}"?`;
-  if(!confirm(msg)) return;
-  subjects = subjects.filter(x=>x.id!==editingSubjectId);
-  if(activeSubjectFilter===editingSubjectId) activeSubjectFilter=null;
-  document.getElementById('subjectOverlay').classList.remove('open');
-  saveSubjects();
-};
-
-/* Item modal */
-document.getElementById('typeToggle').addEventListener('click', e=>{
-  const btn = e.target.closest('button');
-  if(!btn) return;
-  selectedType = btn.dataset.type;
-  document.querySelectorAll('#typeToggle button').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  document.getElementById('iDueLabel').textContent = isExamType(selectedType) ? 'Exam/quiz date' : 'Due date';
-  document.getElementById('chunksField').style.display = selectedType==='project' ? 'block' : 'none';
-});
-document.getElementById('priorityToggle').addEventListener('click', e=>{
-  const btn = e.target.closest('button');
-  if(!btn) return;
-  selectedPriority = btn.dataset.p;
-  document.querySelectorAll('#priorityToggle button').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-});
-let tempChunks = [];
-let tempItemFiles = [];
-let pendingFileTarget = null; // {type:'item'} | {type:'day', date}
-
-function fileLinkFor(fid){ return `${FILES_ORIGIN}/#/f/${(fid||'').split('/')[1]||''}`; }
-
-function renderFileChips(container, files, onRemove){
-  if(!files || !files.length){
-    container.innerHTML = `<span style="color:var(--sub);font-size:0.85rem;">No files yet</span>`;
-    return;
-  }
-  container.innerHTML = files.map((f,idx)=>`
-    <a class="file-chip" href="${fileLinkFor(f.id)}" target="_blank" rel="noopener" data-idx="${idx}">
-      📎 ${escapeHtml(f.title || f.id)}<button class="remove-file" data-remove-idx="${idx}">✕</button>
-    </a>`).join('');
-  container.querySelectorAll('.remove-file').forEach(btn=>{
-    btn.addEventListener('click', e=>{
-      e.preventDefault(); e.stopPropagation();
-      onRemove(Number(btn.dataset.removeIdx));
-    });
-  });
-}
-
-function openFilesNewTab(target){
-  pendingFileTarget = target;
-  window.open(`${FILES_ORIGIN}/#/new`, '_blank', 'noopener=false');
-}
-
-window.addEventListener('message', (event)=>{
-  if(!ALLOWED_FILES_ORIGINS.includes(event.origin)) return;
-  const data = event.data;
-  if(!data || data.type !== 'wnbase-file-attach' || !data.id) return;
-  if(!pendingFileTarget) return;
-  const entry = { id: data.id, title: data.title || data.id };
-  if(pendingFileTarget.type === 'item'){
-    tempItemFiles.push(entry);
-    renderItemFilesList();
-  } else if(pendingFileTarget.type === 'day'){
-    const date = pendingFileTarget.date;
-    (dayFiles[date] = dayFiles[date] || []).push(entry);
-    saveDayFiles();
-    renderDayFilesList(date);
-  }
-  pendingFileTarget = null;
-});
-
-function renderItemFilesList(){
-  renderFileChips(document.getElementById('itemFilesList'), tempItemFiles, (idx)=>{
-    tempItemFiles.splice(idx,1);
-    renderItemFilesList();
-  });
-}
-document.getElementById('itemAddFileBtn').addEventListener('click', ()=> openFilesNewTab({type:'item'}) );
-document.getElementById('itemManualFileBtn').addEventListener('click', ()=>{
-  const row = document.getElementById('itemManualFileRow');
-  row.style.display = row.style.display==='none' ? 'flex' : 'none';
-});
-document.getElementById('itemManualFileAddBtn').addEventListener('click', ()=>{
-  const idInput = document.getElementById('itemManualFileId');
-  const labelInput = document.getElementById('itemManualFileLabel');
-  const id = idInput.value.trim();
-  if(!id || !id.includes('/')){ alert('Enter an ID in the form username/id.'); return; }
-  tempItemFiles.push({ id, title: labelInput.value.trim() || id });
-  idInput.value = ''; labelInput.value = '';
-  document.getElementById('itemManualFileRow').style.display = 'none';
-  renderItemFilesList();
-});
-
-
-function renderChunksList(){
-  const root = document.getElementById('chunksList');
-  if(tempChunks.length===0){
-    root.innerHTML = `<div style="font-size:0.82rem;color:var(--sub);margin-bottom:6px;">No chunks yet — e.g. Research, Draft, Revisions.</div>`;
-  } else {
-    root.innerHTML = tempChunks.map((c,idx)=>`
-      <div class="chunk-row" data-idx="${idx}">
-        <input type="checkbox" class="chunk-done" ${c.done?'checked':''}>
-        <input type="text" placeholder="Chunk name" value="${escapeHtml(c.title)}">
-        <input type="date" value="${c.due||''}">
-        <button class="chunk-remove" title="Remove">✕</button>
-      </div>`).join('');
-  }
-  root.querySelectorAll('.chunk-row').forEach(row=>{
-    const idx = Number(row.dataset.idx);
-    row.querySelector('.chunk-done').addEventListener('change', e=>{ tempChunks[idx].done = e.target.checked; });
-    row.querySelector('input[type="text"]').addEventListener('input', e=>{ tempChunks[idx].title = e.target.value; });
-    row.querySelector('input[type="date"]').addEventListener('input', e=>{ tempChunks[idx].due = e.target.value; });
-    row.querySelector('.chunk-remove').addEventListener('click', ()=>{ tempChunks.splice(idx,1); renderChunksList(); });
-  });
-}
-document.getElementById('addChunkBtn').addEventListener('click', ()=>{
-  tempChunks.push({id:uid(), title:'', due: document.getElementById('iDue').value || todayStr(), done:false});
-  renderChunksList();
-});
-
-function populateSubjectSelect(){
-  const sel = document.getElementById('iSubject');
-  sel.innerHTML = subjects.map(s=>`<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
-}
-function openItemModal(item){
-  editingItemId = item ? item.id : null;
-  populateSubjectSelect();
-  document.getElementById('itemModalTitle').textContent = item ? 'Edit item' : 'New item';
-  selectedType = item ? item.type : 'homework';
-  document.querySelectorAll('#typeToggle button').forEach(b=>b.classList.toggle('active', b.dataset.type===selectedType));
-  document.getElementById('iDueLabel').textContent = isExamType(selectedType) ? 'Exam/quiz date' : 'Due date';
-  selectedPriority = item ? (item.priority||'medium') : 'medium';
-  document.querySelectorAll('#priorityToggle button').forEach(b=>b.classList.toggle('active', b.dataset.p===selectedPriority));
-  document.getElementById('iTitle').value = item ? item.title : '';
-  document.getElementById('iSubject').value = item ? item.subjectId : (subjects[0] ? subjects[0].id : '');
-  document.getElementById('iDue').value = item ? item.due : todayStr();
-  document.getElementById('iNotes').value = item ? (item.notes||'') : '';
-  document.getElementById('chunksField').style.display = selectedType==='project' ? 'block' : 'none';
-  tempChunks = item && item.chunks ? item.chunks.map(c=>({...c})) : [];
-  renderChunksList();
-  tempItemFiles = item && item.files ? item.files.map(f=>({...f})) : [];
-  renderItemFilesList();
-  document.getElementById('itemManualFileRow').style.display = 'none';
-  document.getElementById('itemDeleteBtn').style.visibility = item ? 'visible' : 'hidden';
-  document.getElementById('itemOverlay').classList.add('open');
-  document.getElementById('iTitle').focus();
-}
-document.getElementById('dayModalCloseBtn').onclick = ()=>{ document.getElementById('dayOverlay').classList.remove('open'); if(currentView==='home') renderCalendarView(); };
-document.getElementById('dayOverlay').addEventListener('click', e=>{ if(e.target.id==='dayOverlay'){ e.currentTarget.classList.remove('open'); if(currentView==='home') renderCalendarView(); } });
-
-document.getElementById('newItemBtn').onclick = ()=>{
-  if(subjects.length===0){ alert('Add a subject first.'); openSubjectModal(null); return; }
-  openItemModal(null);
-};
-document.getElementById('itemCancelBtn').onclick = ()=>document.getElementById('itemOverlay').classList.remove('open');
-document.getElementById('itemOverlay').addEventListener('click', e=>{ if(e.target.id==='itemOverlay') e.currentTarget.classList.remove('open'); });
-document.getElementById('itemSaveBtn').onclick = ()=>{
-  const title = document.getElementById('iTitle').value.trim();
-  const due = document.getElementById('iDue').value;
-  if(!title || !due){ alert('Please add a title and date.'); return; }
-  const data = {
-    title, type: selectedType,
-    subjectId: document.getElementById('iSubject').value,
-    due, notes: document.getElementById('iNotes').value.trim(),
-    priority: selectedPriority,
-    chunks: selectedType==='project' ? tempChunks.filter(c=>c.title.trim() && c.due) : [],
-    files: tempItemFiles.slice(),
+function publicPlayer(p) {
+  return {
+    id: p.id, name: p.name, colorIndex: p.colorIndex, role: p.role,
+    x: p.x, y: p.y, skin: p.skin,
+    tagged: p.tagged, tagTime: p.tagTime, connected: p.connected,
+    hitCount: p.hitCount || 0
   };
-  if(editingItemId){
-    const idx = items.findIndex(i=>i.id===editingItemId);
-    items[idx] = {...items[idx], ...data};
-  } else {
-    items.push({id:uid(), done:false, ...data});
-  }
-  document.getElementById('itemOverlay').classList.remove('open');
-  saveItems();
-};
-document.getElementById('itemDeleteBtn').onclick = ()=>{
-  if(!editingItemId) return;
-  if(!confirm('Delete this item?')) return;
-  items = items.filter(i=>i.id!==editingItemId);
-  document.getElementById('itemOverlay').classList.remove('open');
-  saveItems();
-};
-
-function toggleDone(id){
-  if(id.includes('::')){
-    const [itemId, chunkId] = id.split('::');
-    const it = items.find(i=>i.id===itemId);
-    const chunk = (it.chunks||[]).find(c=>c.id===chunkId);
-    if(chunk) chunk.done = !chunk.done;
-    saveItems();
-    return;
-  }
-  const it = items.find(i=>i.id===id);
-  it.done = !it.done;
-  saveItems();
 }
 
-/* Main content render */
-function currentFilteredItems(){
-  let list = items.slice();
-  if(activeSubjectFilter) list = list.filter(i=>i.subjectId===activeSubjectFilter);
-  if(searchQuery){
-    list = list.filter(i=>{
-      const s = subjectById(i.subjectId);
-      return i.title.toLowerCase().includes(searchQuery) ||
-        (s && s.name.toLowerCase().includes(searchQuery)) ||
-        (i.type && i.type.toLowerCase().includes(searchQuery));
-    });
+function publicPlayers(room) {
+  return room.order.filter(id => room.players.has(id)).map(id => publicPlayer(room.players.get(id)));
+}
+
+// While hiders are hiding, seekers must not see where they are or what
+// they're painting — that's the whole game. Strip that data out for them.
+function stripHidersForSeeker(players) {
+  return players.map(p => (p.role === 'hider' ? { ...p, x: null, y: null, skin: null } : p));
+}
+
+// A hider's hit count is only ever meaningful to that hider — showing it
+// to anyone else (especially the seeker who landed the hit) would give
+// away information the game is designed to keep hidden.
+function hideHitCountsExcept(players, viewerId) {
+  return players.map(p => (p.id === viewerId ? p : { ...p, hitCount: 0 }));
+}
+
+function send(ws, obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+function broadcast(room, obj, excludeId) {
+  const data = JSON.stringify(obj);
+  for (const p of room.players.values()) {
+    if (p.id !== excludeId && p.ws && p.ws.readyState === 1) p.ws.send(data);
   }
-  return list;
-}
-function chunkEntriesForDay(dateStr){
-  const out = [];
-  items.forEach(i=>{
-    (i.chunks||[]).forEach(c=>{
-      if(c.due===dateStr){
-        out.push({ id:`${i.id}::${c.id}`, title:`${i.title} — ${c.title}`, type:'chunk',
-          subjectId:i.subjectId, due:c.due, done:c.done, priority:null });
-      }
-    });
-  });
-  return out;
-}
-function itemsForDay(dateStr){
-  return items.filter(i=>i.due===dateStr).concat(chunkEntriesForDay(dateStr));
 }
 
-function renderRow(i){
-  const s = subjectById(i.subjectId);
-  const color = s ? s.color : '#8E8E93';
-  const icon = s ? s.icon : '📄';
-  const n = daysUntil(i.due);
-  const soon = !i.done && n<=1;
-  const pColor = i.priority==='high' ? 'var(--red)' : i.priority==='low' ? '#C7C7CC' : 'var(--accent)';
-  const pDot = i.priority ? `<span class="priority-dot" style="background:${pColor}" title="${i.priority} priority"></span>` : '';
-  const chunks = i.chunks || [];
-  let chunkHtml = '';
-  if(i.type==='project' && chunks.length){
-    const doneN = chunks.filter(c=>c.done).length;
-    const pct = Math.round((doneN/chunks.length)*100);
-    const nextChunk = chunks.filter(c=>!c.done).sort((a,b)=>a.due.localeCompare(b.due))[0];
-    chunkHtml = `<div style="font-size:0.75rem;color:var(--sub);margin-top:2px;">${doneN}/${chunks.length} chunks done${nextChunk?` · next: ${escapeHtml(nextChunk.title)} (${fmtDue(nextChunk.due)})`:''}</div>
-      <div class="progress-bar"><div class="progress-bar-fill" style="width:${pct}%"></div></div>`;
+// Same as broadcast, but only to players matching `predicate` — used to
+// keep hider movement/painting invisible to seekers during hiding.
+function broadcastFiltered(room, obj, predicate, excludeId) {
+  const data = JSON.stringify(obj);
+  for (const p of room.players.values()) {
+    if (p.id === excludeId) continue;
+    if (!predicate(p)) continue;
+    if (p.ws && p.ws.readyState === 1) p.ws.send(data);
   }
-  return `
-  <div class="row ${i.done?'done':''}" data-id="${i.id}">
-    <div class="checkbox ${i.done?'checked':''}" data-check="${i.id}" role="checkbox" aria-checked="${i.done}" tabindex="0">${i.done?'✓':''}</div>
-    <div class="row-icon" style="background:${color}">${icon}</div>
-    <div class="row-body">
-      <div class="row-title">${pDot}${escapeHtml(i.title)}</div>
-      <div class="row-sub">${s?escapeHtml(s.name):'—'} <span class="type-chip">${i.type==='homework'?'assignment':i.type}</span></div>
-      ${chunkHtml}
-    </div>
-    <div class="row-due ${soon?'soon':''}">${fmtDue(i.due)}</div>
-    <div class="chev" data-open="${i.id}">›</div>
-  </div>`;
 }
 
-function priorityRank(p){ return p==='high'?0 : p==='low'?2 : 1; }
-
-function renderSummaryStrip(){
-  const active = items.filter(i=>!i.done);
-  const overdueN = active.filter(i=>daysUntil(i.due)<0).length;
-  const todayN = active.filter(i=>daysUntil(i.due)===0).length;
-  const weekN = active.filter(i=>{ const n=daysUntil(i.due); return n>=0 && n<=6; }).length;
-  const highN = active.filter(i=>i.priority==='high').length;
-  return `
-  <div class="summary-strip">
-    <div class="summary-card overdue"><div class="num">${overdueN}</div><div class="lbl">Overdue</div></div>
-    <div class="summary-card today"><div class="num">${todayN}</div><div class="lbl">Due today</div></div>
-    <div class="summary-card"><div class="num">${weekN}</div><div class="lbl">This week</div></div>
-    <div class="summary-card"><div class="num">${highN}</div><div class="lbl">High priority</div></div>
-  </div>`;
+// Sends each player a room_update honoring the hiding-phase fairness rule.
+function broadcastPlayers(room, extra) {
+  for (const p of room.players.values()) {
+    if (!p.ws || p.ws.readyState !== 1) continue;
+    const players = (room.phase === 'hiding' && p.role === 'seeker')
+      ? stripHidersForSeeker(publicPlayers(room))
+      : publicPlayers(room);
+    send(p.ws, Object.assign({ type: 'room_update', players: hideHitCountsExcept(players, p.id), hostId: room.hostId }, extra || {}));
+  }
 }
 
-function bucketLabel(n){
-  if(n===0) return 'Today';
-  if(n===1) return 'Tomorrow';
-  if(n>1 && n<=6) return 'This Week';
-  return 'Later';
-}
-function groupUpcoming(upcoming){
-  const order = ['Today','Tomorrow','This Week','Later'];
-  const groups = {};
-  upcoming.forEach(i=>{
-    const b = bucketLabel(daysUntil(i.due));
-    (groups[b] = groups[b] || []).push(i);
-  });
-  return order.filter(k=>groups[k] && groups[k].length).map(k=>({label:k, items:groups[k]}));
-}
-function renderNotesPreview(){
-  const upcomingDates = Object.keys(dayNotes).filter(d=>{
-    const n = daysUntil(d);
-    return n>=0 && n<=13 && dayNotes[d] && dayNotes[d].length;
-  }).sort();
-  if(!upcomingDates.length) return '';
-  const rows = upcomingDates.map(d=>{
-    const n = daysUntil(d);
-    const label = n===0 ? 'Today' : n===1 ? 'Tomorrow' : fmtDue(d);
-    const chips = dayNotes[d].map(e=>`<span class="cal-event-chip">${escapeHtml(e)}</span>`).join('');
-    return `<div class="notes-preview-row" data-note-date="${d}">
-      <div class="notes-preview-date">${label}</div>
-      <div class="notes-preview-events">${chips}</div>
-    </div>`;
-  }).join('');
-  return `<div class="notes-preview">
-    <div class="notes-preview-head">📅 Upcoming Events</div>
-    ${rows}
-  </div>`;
-}
-function renderListView(){
-  const root = document.getElementById('listRoot');
-  const list = currentFilteredItems();
-  const showExtras = currentView==='home' && !activeSubjectFilter && !searchQuery;
-  if(list.length===0){
-    root.innerHTML = (showExtras ? renderSummaryStrip() + renderNotesPreview() : '') + `<div class="empty-state"><span class="big">${searchQuery? 'No matches' : 'Nothing here yet'}</span>${searchQuery? 'Try a different search term.' : 'Tap "+ New" to add one.'}</div>`;
-    return;
-  }
-  list.sort((a,b)=> a.due.localeCompare(b.due) || priorityRank(a.priority) - priorityRank(b.priority) || (a.done-b.done));
-  const active = list.filter(i=>!i.done);
-  const overdue = active.filter(i=>daysUntil(i.due)<0);
-  const upcoming = active.filter(i=>daysUntil(i.due)>=0);
-  const done = list.filter(i=>i.done);
-
-  let html = showExtras ? renderSummaryStrip() + renderNotesPreview() : '';
-  if(overdue.length){
-    html += `<div class="group-label" style="color:var(--red)">Overdue <span class="group-count">${overdue.length}</span></div><div class="list">${overdue.map(renderRow).join('')}</div>`;
-  }
-  groupUpcoming(upcoming).forEach(g=>{
-    html += `<div class="group-label">${g.label} <span class="group-count">${g.items.length}</span></div><div class="list">${g.items.map(renderRow).join('')}</div>`;
-  });
-  if(done.length){
-    html += `<div class="group-label clickable" id="completedToggle"><span class="grp-chev">▾</span>Completed <span class="group-count">${done.length}</span></div><div class="list" id="completedList">${done.map(renderRow).join('')}</div>`;
-  }
-  root.innerHTML = html;
-
-  const cToggle = document.getElementById('completedToggle');
-  const cList = document.getElementById('completedList');
-  if(cToggle){
-    if(completedCollapsed){ cToggle.classList.add('collapsed-group'); cList.style.display='none'; }
-    cToggle.addEventListener('click', ()=>{
-      completedCollapsed = !completedCollapsed;
-      localStorage.setItem('plannerCompletedCollapsed', JSON.stringify(completedCollapsed));
-      cToggle.classList.toggle('collapsed-group', completedCollapsed);
-      cList.style.display = completedCollapsed ? 'none' : '';
-    });
-  }
-
-  root.querySelectorAll('[data-check]').forEach(el=>{
-    el.addEventListener('click', e=>{ e.stopPropagation(); toggleDone(el.dataset.check); });
-    el.addEventListener('keydown', e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault(); toggleDone(el.dataset.check);} });
-  });
-  root.querySelectorAll('.row').forEach(row=>{
-    row.addEventListener('click', ()=> openItemModal(items.find(i=>i.id===row.dataset.id)) );
-  });
-  root.querySelectorAll('[data-note-date]').forEach(el=>{
-    el.addEventListener('click', ()=> openDayModal(el.dataset.noteDate) );
-  });
+function clearPhaseTimer(room) {
+  if (room.phaseTimeout) { clearTimeout(room.phaseTimeout); room.phaseTimeout = null; }
 }
 
-function renderCalendarView(){
-  const root = document.getElementById('calendarRoot');
-  const year = calViewDate.getFullYear(), month = calViewDate.getMonth();
-  const label = calViewDate.toLocaleDateString('en-US',{month:'long',year:'numeric'});
-  const firstDow = new Date(year,month,1).getDay();
-  const daysInMonth = new Date(year,month+1,0).getDate();
-  const today = new Date();
-  const isCurMonth = today.getFullYear()===year && today.getMonth()===month;
-
-  const byDay = {};
-  items.forEach(i=>{
-    const d = new Date(i.due+'T00:00:00');
-    if(d.getFullYear()===year && d.getMonth()===month){
-      (byDay[d.getDate()] = byDay[d.getDate()]||[]).push(i);
-    }
-    (i.chunks||[]).forEach(c=>{
-      const cd = new Date(c.due+'T00:00:00');
-      if(cd.getFullYear()===year && cd.getMonth()===month){
-        (byDay[cd.getDate()] = byDay[cd.getDate()]||[]).push({title:`${i.title} — ${c.title}`, subjectId:i.subjectId});
-      }
-    });
-  });
-
-  let grid = ['Su','Mo','Tu','We','Th','Fr','Sa'].map(d=>`<div class="cal-dow">${d}</div>`).join('');
-  for(let i=0;i<firstDow;i++) grid += `<div class="cal-cell empty"></div>`;
-  for(let day=1;day<=daysInMonth;day++){
-    const isToday = isCurMonth && today.getDate()===day;
-    const dayItems = (byDay[day]||[]).slice(0,3);
-    const dots = dayItems.map(i=>{
-      const s = subjectById(i.subjectId);
-      return `<div class="cal-item-dot" style="background:${s?s.color:'#8E8E93'}">${escapeHtml(i.title)}</div>`;
-    }).join('');
-    const dateStr = `${year}-${String(month+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
-    const dt = dayTypeForDate(dateStr);
-    const hasItems = (byDay[day]||[]).length > 0;
-    const dayEvts = dayNotes[dateStr] || [];
-    const dtStyle = dt ? `border-top-color:${dt.color};` : '';
-    const eventMarks = dayEvts.slice(0,2).map(e=>`<div class="cal-event-chip">${escapeHtml(e)}</div>`).join('');
-    grid += `<div class="cal-cell ${isToday?'today':''} ${dt?'has-daytype':''}" style="${dtStyle}" data-date="${dateStr}"><div class="cal-daynum">${day}</div>${dots}${eventMarks}</div>`;
-  }
-
-  root.innerHTML = `
-    <div class="cal-nav-row">
-      <button id="calPrev">‹</button>
-      <div class="cal-month-title">${label}</div>
-      <button id="calNext">›</button>
-    </div>
-    <div class="cal-grid">${grid}</div>
-  `;
-  document.getElementById('calPrev').onclick = ()=>{ calViewDate.setMonth(calViewDate.getMonth()-1); renderCalendarView(); };
-  document.getElementById('calNext').onclick = ()=>{ calViewDate.setMonth(calViewDate.getMonth()+1); renderCalendarView(); };
-  root.querySelectorAll('.cal-cell[data-date]').forEach(cell=>{
-    cell.style.cursor = 'pointer';
-    cell.addEventListener('click', ()=> openDayModal(cell.dataset.date) );
-  });
+function activeHiderCount(room) {
+  return [...room.players.values()].filter(p => p.role === 'hider' && !p.tagged).length;
 }
 
-function openDayModal(dateStr){
-  const dayItems = itemsForDay(dateStr);
-  const d = new Date(dateStr+'T00:00:00');
-  const label = d.toLocaleDateString('en-US',{weekday:'long', month:'long', day:'numeric'});
-  document.getElementById('dayModalTitle').textContent = label;
+// Roles are no longer picked by players — one random player becomes the
+// seeker, everyone else hides, chosen fresh each time the game starts.
+function assignRolesAutomatically(room) {
+  const list = room.order.map(id => room.players.get(id)).filter(Boolean);
+  const seekerIdx = Math.floor(Math.random() * list.length);
+  list.forEach((p, i) => { p.role = (i === seekerIdx) ? 'seeker' : 'hider'; });
+}
 
-  const dt = dayTypeForDate(dateStr);
-  const infoRoot = document.getElementById('dayTypeInfo');
-  if(dt){
-    const classNames = (dt.subjectIds||[]).map(sid=>subjectById(sid)?.name).filter(Boolean);
-    infoRoot.innerHTML = `<span class="type-chip" style="background:${dt.color};color:white;">${escapeHtml(dt.name)}</span> ${classNames.length ? escapeHtml(classNames.join(', ')) : '<span style="color:var(--sub);font-size:0.85rem;">No classes assigned</span>'}`;
-  } else {
-    infoRoot.innerHTML = '';
-  }
-
-  const listRoot = document.getElementById('dayModalList');
-  if(dayItems.length===0){
-    listRoot.innerHTML = `<div class="empty-state" style="padding:24px 0;">Nothing due this day.</div>`;
-  } else {
-    listRoot.innerHTML = `<div class="list">${dayItems.map(renderRow).join('')}</div>`;
-    listRoot.querySelectorAll('[data-check]').forEach(el=>{
-      el.addEventListener('click', e=>{ e.stopPropagation(); toggleDone(el.dataset.check); openDayModal(dateStr); });
-      el.addEventListener('keydown', e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault(); toggleDone(el.dataset.check); openDayModal(dateStr);} });
-    });
-    listRoot.querySelectorAll('.row').forEach(row=>{
-      row.addEventListener('click', ()=>{
-        document.getElementById('dayOverlay').classList.remove('open');
-        const rid = row.dataset.id;
-        const parentId = rid.includes('::') ? rid.split('::')[0] : rid;
-        openItemModal(items.find(i=>i.id===parentId));
-      });
-    });
-  }
-  document.getElementById('dayModalAddBtn').onclick = ()=>{
-    document.getElementById('dayOverlay').classList.remove('open');
-    openItemModal(null);
-    document.getElementById('iDue').value = dateStr;
+function startHiding(room) {
+  clearPhaseTimer(room);
+  // Client loads the host-selected map image (falls back to the first
+  // available map, or a plain placeholder if none are uploaded).
+  const availableMaps = listMapFiles();
+  const mapFile = (room.mapFile && availableMaps.includes(room.mapFile))
+    ? room.mapFile
+    : (availableMaps[0] || null);
+  room.map = {
+    type: 'image',
+    cols: COLS, rows: ROWS,
+    file: mapFile
   };
+  room.phase = 'hiding';
 
-  function renderDayEvents(){
-    const evts = dayNotes[dateStr] || [];
-    const listEl = document.getElementById('dayEventsList');
-    if(!evts.length){
-      listEl.innerHTML = `<span style="color:var(--sub);font-size:0.85rem;">No events yet</span>`;
-    } else {
-      listEl.innerHTML = evts.map((e,idx)=>`<span class="day-event-chip">${escapeHtml(e)}<button class="remove-event" data-idx="${idx}">✕</button></span>`).join('');
-      listEl.querySelectorAll('.remove-event').forEach(btn=>{
-        btn.addEventListener('click', ()=>{
-          dayNotes[dateStr].splice(Number(btn.dataset.idx),1);
-          if(dayNotes[dateStr].length===0) delete dayNotes[dateStr];
-          saveDayNotes();
-          renderDayEvents();
-        });
-      });
+  const hiders = room.order.map(id => room.players.get(id)).filter(p => p && p.role === 'hider');
+  const seekers = room.order.map(id => room.players.get(id)).filter(p => p && p.role === 'seeker');
+
+  hiders.forEach(p => {
+    p.tagged = false;
+    p.tagTime = null;
+    p.hitCount = 0;
+    p.lastHitTime = null;
+    p.skin = makeSkin(TEAM_COLORS[p.colorIndex % TEAM_COLORS.length]);
+    p.x = 2 + Math.random() * (COLS - 4);
+    p.y = 2 + Math.random() * (ROWS - 4);
+  });
+  seekers.forEach((p, i) => {
+    p.tagged = false;
+    p.tagTime = null;
+    p.hitCount = 0;
+    p.lastHitTime = null;
+    p.skin = makeSkin(TEAM_COLORS[p.colorIndex % TEAM_COLORS.length]);
+    const angle = (i / Math.max(1, seekers.length)) * Math.PI * 2;
+    p.x = COLS / 2 + Math.cos(angle) * 1.4;
+    p.y = ROWS / 2 + Math.sin(angle) * 1.4;
+  });
+
+  room.phaseEnd = Date.now() + HIDE_MS;
+  // Seekers get a snapshot with hiders blanked out; hiders see everything.
+  for (const p of room.players.values()) {
+    if (!p.ws || p.ws.readyState !== 1) continue;
+    const players = p.role === 'seeker' ? stripHidersForSeeker(publicPlayers(room)) : publicPlayers(room);
+    send(p.ws, { type: 'phase_change', phase: 'hiding', map: room.map, players, phaseEnd: room.phaseEnd });
+  }
+  room.phaseTimeout = setTimeout(() => startSeeking(room), HIDE_MS);
+}
+
+function startSeeking(room) {
+  clearPhaseTimer(room);
+  room.phase = 'seeking';
+  room.phaseEnd = Date.now() + SEEK_MS;
+  // Full reveal: everyone gets everyone's real position/skin now — but
+  // each hider's hit count still only goes to that hider.
+  const players = publicPlayers(room);
+  for (const p of room.players.values()) {
+    if (!p.ws || p.ws.readyState !== 1) continue;
+    send(p.ws, { type: 'phase_change', phase: 'seeking', players: hideHitCountsExcept(players, p.id), phaseEnd: room.phaseEnd });
+  }
+  room.phaseTimeout = setTimeout(() => {
+    if (room.mode === 'ranked') endRankedSubround(room, false);
+    else endGame(room);
+  }, SEEK_MS);
+}
+
+async function awardWinDiamonds(room, outcome) {
+  const all = [...room.players.values()];
+  // Winners: hiders who were never caught if the hiders won, or every
+  // seeker if the seekers won (they collectively found everyone).
+  const winners = outcome === 'hiders'
+    ? all.filter(p => p.role === 'hider' && !p.tagged)
+    : all.filter(p => p.role === 'seeker');
+  for (const p of winners) {
+    if (!p.account) continue; // guests (not logged in) don't earn diamonds
+    try {
+      const account = await accounts.addDiamonds(p.account, WIN_DIAMONDS, { countAsWin: true });
+      if (account) send(p.ws, { type: 'balance_update', account, delta: WIN_DIAMONDS, reason: 'win' });
+    } catch (e) {
+      console.error('[accounts] award diamonds failed:', e.message);
     }
   }
-  renderDayEvents();
-  const eventInput = document.getElementById('dayEventInput');
-  eventInput.value = '';
-  function addDayEvent(){
-    const v = eventInput.value.trim();
-    if(!v) return;
-    (dayNotes[dateStr] = dayNotes[dateStr] || []).push(v);
-    saveDayNotes();
-    eventInput.value = '';
-    renderDayEvents();
-  }
-  document.getElementById('dayEventAddBtn').onclick = addDayEvent;
-  eventInput.onkeydown = e=>{ if(e.key==='Enter'){ e.preventDefault(); addDayEvent(); } };
-
-  renderDayFilesList(dateStr);
-  document.getElementById('dayAddFileBtn').onclick = ()=> openFilesNewTab({type:'day', date: dateStr});
-  document.getElementById('dayManualFileBtn').onclick = ()=>{
-    const row = document.getElementById('dayManualFileRow');
-    row.style.display = row.style.display==='none' ? 'flex' : 'none';
-  };
-  document.getElementById('dayManualFileRow').style.display = 'none';
-  document.getElementById('dayManualFileAddBtn').onclick = ()=>{
-    const idInput = document.getElementById('dayManualFileId');
-    const labelInput = document.getElementById('dayManualFileLabel');
-    const id = idInput.value.trim();
-    if(!id || !id.includes('/')){ alert('Enter an ID in the form username/id.'); return; }
-    (dayFiles[dateStr] = dayFiles[dateStr] || []).push({ id, title: labelInput.value.trim() || id });
-    saveDayFiles();
-    idInput.value = ''; labelInput.value = '';
-    document.getElementById('dayManualFileRow').style.display = 'none';
-    renderDayFilesList(dateStr);
-  };
-
-  document.getElementById('dayOverlay').classList.add('open');
 }
-function renderDayFilesList(dateStr){
-  const container = document.getElementById('dayFilesList');
-  if(!container) return;
-  renderFileChips(container, dayFiles[dateStr], (idx)=>{
-    dayFiles[dateStr].splice(idx,1);
-    if(dayFiles[dateStr].length===0) delete dayFiles[dateStr];
-    saveDayFiles();
-    renderDayFilesList(dateStr);
+
+function endGame(room) {
+  clearPhaseTimer(room);
+  room.phase = 'results';
+  const all = [...room.players.values()];
+  const hiders = all.filter(p => p.role === 'hider').sort((a, b) => {
+    if (a.tagged !== b.tagged) return a.tagged ? 1 : -1;
+    return (b.tagTime || 0) - (a.tagTime || 0);
+  }).map(publicPlayer);
+  const seekers = all.filter(p => p.role === 'seeker').map(publicPlayer);
+  const outcome = hiders.some(h => !h.tagged) ? 'hiders' : 'seekers';
+  broadcast(room, { type: 'phase_change', phase: 'results', hiders, seekers, outcome });
+  awardWinDiamonds(room, outcome);
+}
+
+function backToLobby(room) {
+  clearPhaseTimer(room);
+  room.phase = 'lobby';
+  room.map = null;
+  room.phaseEnd = null;
+  for (const p of room.players.values()) {
+    p.tagged = false; p.tagTime = null;
+    p.hitCount = 0; p.lastHitTime = null;
+    p.skin = makeSkin(TEAM_COLORS[p.colorIndex % TEAM_COLORS.length]);
+  }
+  broadcast(room, { type: 'phase_change', phase: 'lobby', players: publicPlayers(room), hostId: room.hostId, maps: listMapFiles(), mapFile: room.mapFile });
+}
+
+function maybeEndByNoHidersLeft(room) {
+  if (room.phase !== 'seeking' || activeHiderCount(room) !== 0) return;
+  if (room.mode === 'ranked') endRankedSubround(room, true);
+  else endGame(room);
+}
+
+// ---------- Ranked 1v1 ----------
+// A ranked match is a normal 2-player room (reuses startHiding/startSeeking/
+// the map+tag mechanics) with mode: 'ranked' and a `ranked` state object
+// describing whose turn it is to seek/hide and the redemption bookkeeping
+// described in the design: round N has sub-round A (p1 seeks, p2 hides)
+// then sub-round B (p2 seeks, p1 hides); the match only ends when A and B
+// disagree (one succeeded, one failed) — otherwise both advance, tied, to
+// round N+1.
+function createRankedMatch(wsA, usernameA, wsB, usernameB) {
+  const code = makeCode();
+  const p1Id = crypto.randomBytes(6).toString('hex');
+  const p2Id = crypto.randomBytes(6).toString('hex');
+  const p1 = {
+    id: p1Id, ws: wsA, name: usernameA, account: usernameA, colorIndex: 0, role: 'hider',
+    x: COLS / 2, y: ROWS / 2, skin: makeSkin(TEAM_COLORS[0]),
+    tagged: false, tagTime: null, hitCount: 0, lastHitTime: null, connected: true
+  };
+  const p2 = {
+    id: p2Id, ws: wsB, name: usernameB, account: usernameB, colorIndex: 1, role: 'seeker',
+    x: COLS / 2, y: ROWS / 2, skin: makeSkin(TEAM_COLORS[1]),
+    tagged: false, tagTime: null, hitCount: 0, lastHitTime: null, connected: true
+  };
+  const room = {
+    code, hostId: p1Id, phase: 'lobby', mode: 'ranked',
+    players: new Map([[p1Id, p1], [p2Id, p2]]), order: [p1Id, p2Id],
+    map: null, mapFile: null, phaseEnd: null, phaseTimeout: null,
+    ranked: { p1: p1Id, p2: p2Id, round: 1, sub: 'A', aSuccess: null, bSuccess: null },
+  };
+  rooms.set(code, room);
+  wsA.pas.roomCode = code; wsA.pas.playerId = p1Id;
+  wsB.pas.roomCode = code; wsB.pas.playerId = p2Id;
+  const payloadFor = (myId, opponentName) => ({
+    type: 'ranked_match_start', code, playerId: myId, hostId: room.hostId,
+    players: publicPlayers(room), palette: PALETTE, teamColors: TEAM_COLORS,
+    maps: listMapFiles(), opponent: opponentName,
   });
+  send(wsA, payloadFor(p1Id, usernameB));
+  send(wsB, payloadFor(p2Id, usernameA));
+  startRankedRound(room);
 }
 
-function renderAll(){
-  renderSubjectList();
-  renderDayTypeList();
-  const titles = {home:'Home', all:'Everything'};
-  document.getElementById('mainTitle').innerHTML = `<span class="mobile-menu-btn" id="menuBtn2">☰</span>${titles[currentView]}${activeSubjectFilter?` · ${escapeHtml(subjectById(activeSubjectFilter)?.name||'')}`:''}`;
-  const mb2 = document.getElementById('menuBtn2');
-  if(mb2) mb2.onclick = e=>{ e.stopPropagation(); document.getElementById('sidebar').classList.toggle('open'); };
-  document.getElementById('newItemBtn').style.display = 'inline-block';
+function startRankedRound(room) {
+  const { sub, p1, p2 } = room.ranked;
+  const seeker = room.players.get(sub === 'A' ? p1 : p2);
+  const hider = room.players.get(sub === 'A' ? p2 : p1);
+  if (!seeker || !hider) return;
+  seeker.role = 'seeker';
+  hider.role = 'hider';
+  broadcast(room, { type: 'ranked_round_start', round: room.ranked.round, sub, seekerId: seeker.id, hiderId: hider.id });
+  startHiding(room);
+}
 
-  const root = document.getElementById('mainContent');
-  if(!document.getElementById('calendarRoot')){
-    root.innerHTML = `<div id="calendarRoot"></div><div id="listRoot"></div>`;
+function resetRankedPlayers(room) {
+  for (const p of room.players.values()) {
+    p.tagged = false; p.tagTime = null; p.hitCount = 0; p.lastHitTime = null;
   }
-  document.getElementById('calendarRoot').style.display = (currentView==='home') ? 'block' : 'none';
-  if(currentView==='home') renderCalendarView();
-  renderListView();
 }
 
-renderAll();
-</script>
-</body>
-</html>
+function endRankedSubround(room, success) {
+  clearPhaseTimer(room);
+  const r = room.ranked;
+  if (r.sub === 'A') {
+    r.aSuccess = success;
+    r.sub = 'B';
+    resetRankedPlayers(room);
+    broadcast(room, { type: 'ranked_subround_result', round: r.round, sub: 'A', success });
+    startRankedRound(room);
+    return;
+  }
+  r.bSuccess = success;
+  broadcast(room, { type: 'ranked_subround_result', round: r.round, sub: 'B', success });
+  if (r.aSuccess !== r.bSuccess) {
+    const winnerId = r.aSuccess ? r.p1 : r.p2;
+    const loserId = r.aSuccess ? r.p2 : r.p1;
+    endRankedMatch(room, winnerId, loserId);
+  } else {
+    r.round += 1;
+    r.sub = 'A';
+    r.aSuccess = null; r.bSuccess = null;
+    resetRankedPlayers(room);
+    broadcast(room, { type: 'ranked_round_advance', round: r.round });
+    startRankedRound(room);
+  }
+}
+
+async function endRankedMatch(room, winnerId, loserId) {
+  clearPhaseTimer(room);
+  room.phase = 'results';
+  const winner = room.players.get(winnerId);
+  const loser = room.players.get(loserId);
+  const roundsPlayed = room.ranked.round;
+  broadcast(room, {
+    type: 'phase_change', phase: 'results', mode: 'ranked',
+    winnerId, loserId, roundsPlayed,
+  });
+  if (winner?.account && loser?.account) {
+    try {
+      const result = await accounts.recordRankedResult(winner.account, loser.account, roundsPlayed);
+      if (result.winner) send(winner.ws, { type: 'balance_update', account: result.winner, delta: 6, reason: 'ranked_win' });
+      if (result.loser) send(loser.ws, { type: 'balance_update', account: result.loser, reason: 'ranked_loss' });
+    } catch (e) {
+      console.error('[accounts] ranked result failed:', e.message);
+    }
+  }
+}
+
+function removePlayer(room, id) {
+  const p = room.players.get(id);
+  if (!p) return;
+  room.players.delete(id);
+  room.order = room.order.filter(x => x !== id);
+  if (room.hostId === id) {
+    room.hostId = room.order[0] || null;
+  }
+  if (room.players.size === 0) {
+    clearPhaseTimer(room);
+    setTimeout(() => {
+      if (rooms.get(room.code) === room && room.players.size === 0) rooms.delete(room.code);
+    }, 5 * 60 * 1000);
+    return;
+  }
+  broadcastPlayers(room);
+  maybeEndByNoHidersLeft(room);
+}
+
+wss.on('connection', (ws) => {
+  // Mutable per-connection state lives on the ws object itself (not a
+  // closured `let`) so that accepting a ranked challenge — which happens
+  // inside a *different* connection's message handler — can push this
+  // connection straight into a new room.
+  ws.pas = { roomCode: null, playerId: null, account: null };
+
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    // ---- account presence (for friends list / ranked challenges) ----
+    if (msg.type === 'identify') {
+      const username = sessions.get(String(msg.token || ''));
+      if (!username) { send(ws, { type: 'error', message: 'Not logged in.' }); return; }
+      ws.pas.account = username;
+      presenceSockets.set(username, ws);
+      send(ws, { type: 'identified', username });
+      return;
+    }
+
+    if (msg.type === 'challenge') {
+      const from = ws.pas.account;
+      if (!from) { send(ws, { type: 'error', message: 'Log in to send ranked challenges.' }); return; }
+      const to = String(msg.username || '').trim();
+      const targetWs = presenceSockets.get(to);
+      if (!targetWs || targetWs.readyState !== 1) { send(ws, { type: 'error', message: `${to} isn't online right now.` }); return; }
+      accounts.areFriends(from, to).then(ok => {
+        if (!ok) { send(ws, { type: 'error', message: 'You can only challenge friends.' }); return; }
+        const key = [from, to].sort().join('|');
+        pendingChallenges.set(key, { from, to });
+        send(targetWs, { type: 'challenge_received', from });
+        send(ws, { type: 'challenge_sent', to });
+      }).catch(() => send(ws, { type: 'error', message: 'Could not send challenge.' }));
+      return;
+    }
+
+    if (msg.type === 'challenge_response') {
+      const me = ws.pas.account;
+      if (!me) return;
+      const from = String(msg.from || '').trim();
+      const key = [me, from].sort().join('|');
+      const pending = pendingChallenges.get(key);
+      if (!pending || pending.to !== me) { send(ws, { type: 'error', message: 'That challenge is no longer available.' }); return; }
+      pendingChallenges.delete(key);
+      if (!msg.accept) {
+        const fromWs = presenceSockets.get(from);
+        if (fromWs) send(fromWs, { type: 'challenge_declined', by: me });
+        return;
+      }
+      const fromWs = presenceSockets.get(from);
+      if (!fromWs || fromWs.readyState !== 1) { send(ws, { type: 'error', message: `${from} disconnected.` }); return; }
+      createRankedMatch(fromWs, from, ws, me);
+      return;
+    }
+
+    if (msg.type === 'cancel_challenge') {
+      const me = ws.pas.account;
+      const to = String(msg.username || '').trim();
+      const key = [me, to].sort().join('|');
+      pendingChallenges.delete(key);
+      const toWs = presenceSockets.get(to);
+      if (toWs) send(toWs, { type: 'challenge_declined', by: me });
+      return;
+    }
+
+    if (msg.type === 'create') {
+      const name = String(msg.name || 'Painter').slice(0, 16).trim() || 'Painter';
+      const account = sessions.get(String(msg.token || '')) || null;
+      const code = makeCode();
+      ws.pas.playerId = crypto.randomBytes(6).toString('hex');
+      const playerId = ws.pas.playerId;
+      const player = {
+        id: playerId, ws, name, account, colorIndex: 0, role: 'hider',
+        x: COLS / 2, y: ROWS / 2, skin: makeSkin(TEAM_COLORS[0]),
+        tagged: false, tagTime: null, hitCount: 0, lastHitTime: null, connected: true
+      };
+      const room = {
+        code, hostId: playerId, phase: 'lobby', mode: 'ffa',
+        players: new Map([[playerId, player]]), order: [playerId],
+        map: null, mapFile: null, phaseEnd: null, phaseTimeout: null
+      };
+      rooms.set(code, room);
+      ws.pas.roomCode = code;
+      send(ws, { type: 'created', code, playerId, hostId: room.hostId, players: publicPlayers(room), palette: PALETTE, teamColors: TEAM_COLORS, maps: listMapFiles(), mapFile: room.mapFile });
+      return;
+    }
+
+    if (msg.type === 'join') {
+      const code = String(msg.code || '').toUpperCase().trim();
+      const room = rooms.get(code);
+      if (!room) { send(ws, { type: 'error', message: `No room found with code ${code}.` }); return; }
+      if (room.players.size >= MAX_PLAYERS) { send(ws, { type: 'error', message: 'That room is full (4 players max).' }); return; }
+      if (room.phase !== 'lobby') { send(ws, { type: 'error', message: 'That game has already started. Ask the host for a new room.' }); return; }
+      const name = String(msg.name || 'Painter').slice(0, 16).trim() || 'Painter';
+      const account = sessions.get(String(msg.token || '')) || null;
+      ws.pas.playerId = crypto.randomBytes(6).toString('hex');
+      const playerId = ws.pas.playerId;
+      const colorIndex = room.order.length % TEAM_COLORS.length;
+      const player = {
+        id: playerId, ws, name, account, colorIndex, role: 'hider',
+        x: COLS / 2, y: ROWS / 2, skin: makeSkin(TEAM_COLORS[colorIndex]),
+        tagged: false, tagTime: null, hitCount: 0, lastHitTime: null, connected: true
+      };
+      room.players.set(playerId, player);
+      room.order.push(playerId);
+      ws.pas.roomCode = code;
+      send(ws, { type: 'joined', code, playerId, hostId: room.hostId, players: publicPlayers(room), phase: room.phase, palette: PALETTE, teamColors: TEAM_COLORS, maps: listMapFiles(), mapFile: room.mapFile });
+      broadcastPlayers(room);
+      return;
+    }
+
+    const room = rooms.get(ws.pas.roomCode);
+    if (!room || !ws.pas.playerId || !room.players.has(ws.pas.playerId)) return;
+    const playerId = ws.pas.playerId;
+    const me = room.players.get(playerId);
+
+    switch (msg.type) {
+      case 'set_map': {
+        if (room.hostId !== playerId) return;
+        if (room.phase !== 'lobby') return;
+        const file = String(msg.file || '');
+        const available = listMapFiles();
+        if (file && !available.includes(file)) return;
+        room.mapFile = file || null;
+        broadcast(room, { type: 'map_selected', mapFile: room.mapFile });
+        break;
+      }
+      case 'start': {
+        if (room.mode === 'ranked') return; // ranked matches auto-start, no lobby
+        if (room.hostId !== playerId) return;
+        if (room.phase !== 'lobby') return;
+        if (room.players.size < 2) { send(ws, { type: 'error', message: 'Need at least 2 players to start.' }); return; }
+        assignRolesAutomatically(room);
+        startHiding(room);
+        break;
+      }
+      case 'move': {
+        if (room.phase !== 'hiding' && room.phase !== 'seeking') return;
+        if (room.phase === 'hiding' && me.role === 'seeker') return; // seekers are frozen while hiders hide
+        const x = Number(msg.x), y = Number(msg.y);
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+          me.x = Math.max(0.3, Math.min(COLS - 0.3, x));
+          me.y = Math.max(0.3, Math.min(ROWS - 0.3, y));
+          if (room.phase === 'hiding') {
+            broadcastFiltered(room, { type: 'player_moved', id: playerId, x: me.x, y: me.y }, p => p.role === 'hider', playerId);
+          } else {
+            broadcast(room, { type: 'player_moved', id: playerId, x: me.x, y: me.y }, playerId);
+          }
+        }
+        break;
+      }
+      case 'paint_skin': {
+        if (me.role !== 'hider') return;
+        const skin = msg.skin;
+        const hexRe = /^#[0-9a-fA-F]{6}$/;
+        if (Array.isArray(skin) && skin.length === SKIN_SIZE * SKIN_SIZE && skin.every(h => typeof h === 'string' && hexRe.test(h))) {
+          me.skin = skin;
+          if (room.phase === 'hiding') {
+            broadcastFiltered(room, { type: 'player_skin', id: playerId, skin: me.skin }, p => p.role === 'hider', playerId);
+          } else {
+            broadcast(room, { type: 'player_skin', id: playerId, skin: me.skin }, playerId);
+          }
+        }
+        break;
+      }
+      case 'tag': {
+        if (room.phase !== 'seeking') return;
+        if (me.role !== 'seeker') return;
+        const target = room.players.get(msg.targetId);
+        if (!target || target.role !== 'hider' || target.tagged) return;
+        const dx = target.x - me.x, dy = target.y - me.y;
+        if (Math.hypot(dx, dy) > TAG_RADIUS) return;
+        // Cooldown so one lingering touch doesn't rack up multiple hits —
+        // the seeker has to actually tap again, ideally after some
+        // separation, to land the second hit.
+        const now = Date.now();
+        if (target.lastHitTime && now - target.lastHitTime < TAG_COOLDOWN_MS) return;
+        target.lastHitTime = now;
+        target.hitCount = (target.hitCount || 0) + 1;
+        if (target.hitCount >= HITS_TO_CATCH) {
+          target.tagged = true;
+          target.tagTime = now;
+          broadcast(room, { type: 'player_tagged', id: target.id, byId: me.id, tagTime: target.tagTime });
+          maybeEndByNoHidersLeft(room);
+        } else {
+          send(target.ws, { type: 'player_hit', id: target.id, hitCount: target.hitCount });
+        }
+        break;
+      }
+      case 'play_again': {
+        if (room.mode === 'ranked') return;
+        if (room.hostId !== playerId) return;
+        if (room.phase !== 'results') return;
+        backToLobby(room);
+        break;
+      }
+      case 'leave': {
+        removePlayer(room, playerId);
+        ws.pas.roomCode = null; ws.pas.playerId = null;
+        try { ws.close(); } catch {}
+        break;
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    const room = rooms.get(ws.pas.roomCode);
+    if (room && ws.pas.playerId) removePlayer(room, ws.pas.playerId);
+    if (ws.pas.account && presenceSockets.get(ws.pas.account) === ws) presenceSockets.delete(ws.pas.account);
+  });
+});
+
+accounts.initDb().catch(e => console.error('[accounts] init failed:', e.message));
+
+server.listen(PORT, () => {
+  console.log(`Paint & Seek listening on :${PORT}`);
+});
